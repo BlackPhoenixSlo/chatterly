@@ -49,15 +49,22 @@ repo; they are created locally the first time you boot.
 Requires Docker 20+ with the `compose` plugin.
 
 ```bash
-git clone https://github.com/<your-fork>/chatterly.git
+git clone https://github.com/BlackPhoenixSlo/chatterly.git
 cd chatterly
 
-# First boot needs an empty proxy registry so the bind-mount has something
-# to attach to. (You will fill it from the UI.)
+# First boot needs the bind-mount sources to exist as files (otherwise
+# Docker creates empty directories with those names and the relay can't
+# open them). You will fill both from the UI later.
 echo '{"proxies": []}' > service/proxies.json
+touch service/chatterly.db
+
+# SHARE_TOKEN gates every non-/health request. Generate one and keep it
+# somewhere safe — anyone with this token can act as your captured OF
+# account through the UI.
+export SHARE_TOKEN=$(openssl rand -hex 24)
 
 docker compose up -d --build
-open http://127.0.0.1:8787/ui/
+open "http://127.0.0.1:3001/?t=$SHARE_TOKEN"
 ```
 
 The UI loads but `/health` will be red — that is expected. There is no
