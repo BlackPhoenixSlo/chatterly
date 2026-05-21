@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+
+# Node
+node_modules/
+.next/
+dist/
+
+# Local state — anything containing real session data, account data, or secrets
+service/proxies.json
+service/chatterly.db
+service/chatterly.db-journal
+service/chatterly.db-wal
+service/chatterly.db-shm
+service/sessions/
+.run_public/
+onlystackAPP/
+
+# Secrets / one-off captures
+claudflaretoken
+my_Curl_session.example
+of_calls_tail.txt
+errors
+bookmark_error_curl

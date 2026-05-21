@@ -1,0 +1,368 @@
+"use client";
+
+/**
+ * /group — group-chat tab. Up to 8 individual fan conversations rendered
+ * side-by-side for fast multi-chat across accounts/models.
+ *
+ * Not a real group thread (OF has no such concept) — just stacked panes,
+ * each posting to its own one-on-one chat.
+ *
+ * Per-tab identity: each /group tab generates a tabId (persisted in
+ * sessionStorage so a refresh keeps it) and publishes its current state
+ * under `chatterly:group-tab:<tabId>` in localStorage with a heartbeat.
+ * Source tabs scan all live registries to route adds — clicking 👥 group
+ * on a fan already in some tab focuses that specific tab; otherwise the
+ * fan goes into the freshest tab with room; if all live tabs are full,
+ * a fresh group tab is spawned. Net effect: no accidental duplicates of
+ * the same fan across multiple group tabs.
+ *
+ * BroadcastChannel messages carry the target tabId so only the addressed
+ * tab acts on add/focus.
+ */
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+
+import { ChatList, type ChatListSelection } from "@/components/chat/ChatList";
+import { GroupPane } from "@/components/group/GroupPane";
+import { useInboxRealtime } from "@/hooks/useInboxRealtime";
+import {
+  GROUP_CHANNEL_NAME,
+  GROUP_HEARTBEAT_MS,
+  GROUP_HEARTBEAT_TTL_MS,
+  GROUP_SLOT_CAP,
+  GROUP_WINDOW_NAME,
+  readAllLiveGroupTabs,
+  removeGroupTabRegistry,
+  writeGroupTabRegistry,
+  type GroupChannelMessage,
+  type GroupSlot,
+} from "@/lib/groupChannel";
+
+const STORAGE_KEY = "chatterly:group-slots";
+const TAB_ID_KEY = "chatterly:group-tab-id";
+
+type Slot = GroupSlot;
+
+function readSlots(): Slot[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.sessionStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const out: Slot[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const acct = (item as { accountId?: unknown }).accountId;
+      const fan = (item as { fanId?: unknown }).fanId;
+      if (typeof acct !== "string" || typeof fan !== "number") continue;
+      if (!Number.isFinite(fan)) continue;
+      out.push({ accountId: acct, fanId: fan });
+    }
+    return out.slice(0, GROUP_SLOT_CAP);
+  } catch {
+    return [];
+  }
+}
+
+function writeSlots(slots: Slot[]): void {
+  try {
+    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(slots));
+  } catch {
+    /* quota / safari private — accept the loss */
+  }
+}
+
+/** Parse `?add=<acctId>:<fanId>&spawn=<token>` once and clear them from
+ *  the URL so a refresh doesn't re-add or re-claim. Returns the seed
+ *  (or null) and the spawn token (or null). */
+function takeAddParam(): { seed: Slot | null; spawnToken: string | null } {
+  if (typeof window === "undefined") return { seed: null, spawnToken: null };
+  const url = new URL(window.location.href);
+  const raw = url.searchParams.get("add");
+  const spawnToken = url.searchParams.get("spawn");
+  if (!raw && !spawnToken) return { seed: null, spawnToken: null };
+  url.searchParams.delete("add");
+  url.searchParams.delete("spawn");
+  // replaceState — we don't want these to live in history.
+  window.history.replaceState({}, "", url.pathname + (url.search ? url.search : "") + url.hash);
+  if (!raw) return { seed: null, spawnToken };
+  const idx = raw.lastIndexOf(":");
+  if (idx <= 0) return { seed: null, spawnToken };
+  const accountId = raw.slice(0, idx);
+  const fan = Number(raw.slice(idx + 1));
+  if (!accountId || !Number.isFinite(fan) || fan <= 0) return { seed: null, spawnToken };
+  return { seed: { accountId, fanId: fan }, spawnToken };
+}
+
+/** Stable per-tab id. Re-uses an existing one from sessionStorage so a
+ *  refresh doesn't rotate identity (which would orphan the registry
+ *  entry for TTL before scanners cleaned up). */
+function resolveTabId(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const existing = window.sessionStorage.getItem(TAB_ID_KEY);
+    if (existing) return existing;
+    const cryptoObj = window.crypto as Crypto & { randomUUID?: () => string };
+    const id = cryptoObj.randomUUID
+      ? cryptoObj.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    window.sessionStorage.setItem(TAB_ID_KEY, id);
+    return id;
+  } catch {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+export default function GroupChatPage() {
+  // Keep SSE patches landing in the right query caches — same hook the
+  // inbox page mounts. Without it the panes only pick up new messages
+  // via the 30s poll.
+  useInboxRealtime();
+
+  // Hydration-gated: SSR renders nothing, the post-mount effect seeds
+  // from sessionStorage + ?add=. Avoids a flicker of empty grid.
+  const [slots, setSlots] = useState<Slot[]>([]);
+  const [hydrated, setHydrated] = useState(false);
+  const tabIdRef = useRef<string>("");
+  const createdAtRef = useRef<number>(0);
+  const spawnTokenRef = useRef<string | null>(null);
+  const lastTickAtRef = useRef<number>(0);
+
+  // Keep a ref to current slots so the heartbeat interval can publish
+  // them without needing to re-bind every change. State drives React;
+  // the ref just exists for cross-effect reads.
+  const slotsRef = useRef<Slot[]>([]);
+  useEffect(() => { slotsRef.current = slots; }, [slots]);
+
+  useEffect(() => {
+    tabIdRef.current = resolveTabId();
+    createdAtRef.current = Date.now();
+    const { seed, spawnToken } = takeAddParam();
+    spawnTokenRef.current = spawnToken;
+    // ?add= is the marker that this is a FRESHLY-OPENED group tab
+    // (someone clicked 👥 group on a chat — either the cold path or
+    // the overflow path). In both cases the new tab should start
+    // clean with just the requested fan, even though some browsers
+    // copy sessionStorage to a window.open'd child (which would
+    // otherwise carry over the previous group session's slots).
+    //
+    // No ?add= means this is a reload of the SAME tab (or someone
+    // typed /group manually) — restore the slot list from
+    // sessionStorage so refresh keeps the layout.
+    let initial: Slot[] = seed ? [seed] : readSlots();
+    // Reconcile-on-mount: drop slots that an OLDER live tab already
+    // holds. Handles the residual case where two source tabs raced
+    // to spawn and we both ended up with the same fan. Older wins.
+    const others = readAllLiveGroupTabs().filter((t) => t.tabId !== tabIdRef.current);
+    if (others.length > 0) {
+      initial = initial.filter((s) => {
+        const olderOwner = others.find((t) =>
+          t.createdAt < createdAtRef.current &&
+          t.slots.some((x) => x.accountId === s.accountId && x.fanId === s.fanId),
+        );
+        return !olderOwner;
+      });
+    }
+    setSlots(initial);
+    writeSlots(initial);
+    setHydrated(true);
+  }, []);
+
+  // Persist on every change. Also write the per-tab registry entry so
+  // source tabs see the updated slot list immediately (heartbeat tick
+  // also writes, but that has up to GROUP_HEARTBEAT_MS lag).
+  useEffect(() => {
+    if (!hydrated) return;
+    writeSlots(slots);
+    if (tabIdRef.current) writeGroupTabRegistry(tabIdRef.current, createdAtRef.current, slots);
+  }, [slots, hydrated]);
+
+  const addSlot = useCallback((sel: ChatListSelection) => {
+    setSlots((cur) => {
+      if (cur.some((s) => s.accountId === sel.accountId && s.fanId === sel.fanId)) {
+        return cur;
+      }
+      if (cur.length >= GROUP_SLOT_CAP) return cur;
+      return [...cur, { accountId: sel.accountId, fanId: sel.fanId }];
+    });
+  }, []);
+
+  // Heartbeat (registry refresh) + BroadcastChannel listener. The
+  // registry is keyed by this tab's id, so multiple group tabs each
+  // have their own entry — last-writer-wins doesn't apply, scanners
+  // see all of them.
+  useEffect(() => {
+    if (!hydrated) return;
+    // Stamp window.name so a same-BCG window.open(..., GROUP_WINDOW_NAME)
+    // call can find this tab. Cross-BCG it doesn't — focus relies on
+    // the broadcast path for those cases.
+    try { window.name = GROUP_WINDOW_NAME; } catch { /* sealed in some iframes */ }
+    const tabId = tabIdRef.current;
+    if (!tabId) return;
+
+    const tick = () => {
+      writeGroupTabRegistry(tabId, createdAtRef.current, slotsRef.current);
+      lastTickAtRef.current = Date.now();
+    };
+    tick();
+    const interval = window.setInterval(tick, GROUP_HEARTBEAT_MS);
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel(GROUP_CHANNEL_NAME);
+      const ch = channel;
+      // Announce ourselves so the source that spawned us can pair its
+      // held Window ref with our tabId. No-op for the source(s) that
+      // didn't spawn us (they ignore claims for tokens they don't hold).
+      if (spawnTokenRef.current) {
+        try { ch.postMessage({ type: "claim", tabId, spawnToken: spawnTokenRef.current }); } catch {}
+      }
+      ch.onmessage = (e: MessageEvent<GroupChannelMessage>) => {
+        const msg = e.data;
+        if (!msg) return;
+        // Address filter: ignore messages not meant for THIS tab.
+        // Multiple group tabs are alive simultaneously and each scopes
+        // its actions to its own tabId.
+        if (msg.type !== "add" && msg.type !== "focus") return;
+        if (msg.tabId !== tabId) return;
+        if (msg.type === "add") {
+          if (typeof msg.accountId !== "string" || typeof msg.fanId !== "number") return;
+          let accepted = false;
+          setSlots((cur) => {
+            if (cur.some((s) => s.accountId === msg.accountId && s.fanId === msg.fanId)) {
+              accepted = true;
+              return cur;
+            }
+            if (cur.length >= GROUP_SLOT_CAP) {
+              accepted = false;
+              return cur;
+            }
+            accepted = true;
+            return [...cur, { accountId: msg.accountId, fanId: msg.fanId }];
+          });
+          // ACK lets the source decide whether to spawn an overflow tab
+          // when we couldn't actually accept (full since the snapshot).
+          try { ch.postMessage({ type: "add-ack", tabId, reqId: msg.reqId, ok: accepted }); } catch {}
+        }
+        // For both add and focus: try to bring this tab forward.
+        // Browsers vary on whether window.focus() from a
+        // BroadcastChannel handler is honored. When it works the click
+        // on the source tab feels like "switched to group". When
+        // denied, slot still landed; user alt-tabs manually.
+        try { window.focus(); } catch { /* policy denial — ignore */ }
+      };
+    } catch {
+      /* No BroadcastChannel — gracefully degrade. The source tab's
+         fallback path (window.open with ?add=) still works. */
+    }
+
+    // Frozen-tab reconcile: if this tab was background-throttled for
+    // longer than the registry TTL, another tab may have spawned and
+    // taken on our fans assuming we were dead. On wake, drop any of
+    // our slots that ANY other live tab also holds — the user has
+    // moved on, the other tab is canonical.
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") return;
+      const stale = Date.now() - lastTickAtRef.current > GROUP_HEARTBEAT_TTL_MS;
+      // Refresh our heartbeat immediately regardless — keeps scanners
+      // from treating us as dead during the reconcile pass.
+      tick();
+      if (!stale) return;
+      const others = readAllLiveGroupTabs().filter((t) => t.tabId !== tabId);
+      if (others.length === 0) return;
+      setSlots((cur) => cur.filter((s) => !others.some((t) =>
+        t.slots.some((x) => x.accountId === s.accountId && x.fanId === s.fanId),
+      )));
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
+    // pagehide is the reliable cross-browser teardown signal (fires on
+    // bfcache eviction and iOS where beforeunload is unreliable).
+    const onPagehide = () => { removeGroupTabRegistry(tabId); };
+    window.addEventListener("pagehide", onPagehide);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("pagehide", onPagehide);
+      document.removeEventListener("visibilitychange", onVisibility);
+      removeGroupTabRegistry(tabId);
+      if (channel) { try { channel.close(); } catch {} }
+    };
+  }, [hydrated]);
+
+  const removeSlot = useCallback((accountId: string, fanId: number) => {
+    setSlots((cur) =>
+      cur.filter((s) => !(s.accountId === accountId && s.fanId === fanId)),
+    );
+  }, []);
+
+  const full = slots.length >= GROUP_SLOT_CAP;
+  // Responsive grid: panes shrink as count grows. Tailwind picks the
+  // narrowest column that still fits ~280px content. At 8 panes on a
+  // 1440 monitor that lands at ~250px each — tight but legible.
+  const gridCols =
+    slots.length <= 1
+      ? "grid-cols-1"
+      : slots.length === 2
+        ? "grid-cols-2"
+        : slots.length <= 4
+          ? "grid-cols-2 lg:grid-cols-2 xl:grid-cols-2"
+          : "grid-cols-2 lg:grid-cols-3 xl:grid-cols-4";
+
+  return (
+    <div className="h-[calc(100vh-3.5rem)] grid grid-cols-[300px_minmax(0,1fr)] overflow-hidden">
+      <div className="flex flex-col min-h-0 border-r border-border bg-panel">
+        <div className="px-3 py-2 border-b border-border flex items-center justify-between gap-2">
+          <div className="text-xs font-semibold">Group chat</div>
+          <div className="text-[10px] text-fg-dim shrink-0">
+            {slots.length} / {GROUP_SLOT_CAP}
+          </div>
+        </div>
+        <div className="px-3 py-2 border-b border-border text-[11px] text-fg-dim flex items-center justify-between gap-2">
+          <Link href="/inbox" className="hover:text-fg underline underline-offset-2">
+            ← inbox
+          </Link>
+          {full && <span className="text-warn">full — close one to add</span>}
+        </div>
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <ChatList
+            selected={null}
+            onSelect={(sel) => {
+              if (full) return;
+              addSlot(sel);
+            }}
+          />
+        </div>
+      </div>
+
+      <div className="min-h-0 overflow-hidden">
+        {!hydrated ? (
+          <div className="grid place-items-center h-full text-sm text-fg-dim">…</div>
+        ) : slots.length === 0 ? (
+          <div className="grid place-items-center h-full p-8 text-center">
+            <div className="max-w-sm space-y-2">
+              <div className="text-sm font-medium">No chats in this group yet.</div>
+              <p className="text-xs text-fg-dim">
+                Click any conversation in the left rail to add it. Up to {GROUP_SLOT_CAP}
+                {" "}panes side-by-side; refresh keeps them — close the tab to clear.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div className={`grid ${gridCols} gap-2 p-2 h-full overflow-auto`}>
+            {slots.map((s) => (
+              <GroupPane
+                key={`${s.accountId}:${s.fanId}`}
+                accountId={s.accountId}
+                fanId={s.fanId}
+                onClose={() => removeSlot(s.accountId, s.fanId)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

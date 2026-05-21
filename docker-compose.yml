@@ -1,0 +1,132 @@
+# OF Relay full stack — replaces `./scripts/start.sh`.
+#
+#   docker compose up -d --build       # build + start relay + Next.js UI
+#   docker compose logs -f             # tail both services
+#   docker compose down                # graceful stop (SIGTERM → 10s grace)
+#
+# What's running after `up`:
+#   relay  127.0.0.1:8787  — FastAPI / uvicorn  (the Python relay)
+#   app    127.0.0.1:3001  — Next.js prod build (the /inbox UI)
+#
+# The Next container reaches the relay container by DNS (`http://relay:8787`)
+# over the internal compose network. The browser only ever talks to 3001.
+#
+# Persisted on the host (so a rebuild never wipes your auth or history):
+#   ./service/chatterly.db        SQLite event store
+#   ./service/sessions/           captured OF sessions
+#   ./service/proxies.json        proxy registry
+#
+# To expose publicly: run `tailscale funnel --bg 3001` on the host (same as
+# start.sh's funnel block), OR put Caddy/Traefik in front and add a third
+# service. Don't change the `127.0.0.1:` ports here — the SHARE_TOKEN gate
+# is the only auth, so direct LAN exposure is intentionally opt-in.
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatterly-relay:latest
+    container_name: chatterly-relay
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      # Required. Generate one once and export it before `docker compose up`:
+      #   export SHARE_TOKEN=$(openssl rand -hex 24)
+      # Anyone who has this token can hit /ui/?t=<token> and act as your
+      # captured OF account, so treat it like a password.
+      SHARE_TOKEN: "${SHARE_TOKEN:?set SHARE_TOKEN before docker compose up}"
+    volumes:
+      # File bind-mount for the SQLite event store. WAL + SHM sidecars
+      # are created in /app/service/ inside the container; on `docker
+      # compose down` (SIGTERM) SQLite checkpoints them back into the
+      # bind-mounted file. Avoid `docker kill` if you can.
+      - ./service/chatterly.db:/app/service/chatterly.db
+      - ./service/sessions:/app/service/sessions
+      - ./service/proxies.json:/app/service/proxies.json
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    labels:
+      # Picked up by the autoheal sidecar — when this container goes
+      # unhealthy (3 failed checks), autoheal restarts it. `restart:
+      # unless-stopped` only catches actual exits, not hangs or
+      # deadlocks where the process stays alive but stops answering.
+      autoheal: "true"
+    # Cap container log growth. Without this the JSON-file driver writes
+    # forever; a week of OF traffic at INFO can balloon to 1+ GB.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    image: chatterly-app:latest
+    container_name: chatterly-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      # `relay` resolves to the sibling container on the compose network.
+      # next.config.ts's rewrites() forwards /api/of/*, /admin/*, /events,
+      # /ws/*, /ui/*, /img, /health to this URL.
+      RELAY_URL: "http://relay:8787"
+    depends_on:
+      relay:
+        condition: service_healthy
+    healthcheck:
+      # `next start` doesn't expose a dedicated health endpoint, but `/`
+      # is the home redirect to /inbox and is always served in prod.
+      # node:20-bookworm-slim has neither curl nor wget; use the node
+      # runtime that's already in the image. Exit 0 if status < 400,
+      # else 1. Network errors throw and exit 1 too.
+      test:
+        - CMD
+        - node
+        - -e
+        - |
+          require('http').get('http://127.0.0.1:3001/', r => process.exit(r.statusCode < 400 ? 0 : 1)).on('error', () => process.exit(1));
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    labels:
+      autoheal: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─── autoheal ───────────────────────────────────────────────────
+  # Restarts containers that go unhealthy. `restart: unless-stopped` on
+  # the other services only kicks in on actual process exit; a request
+  # handler stuck in a deadlock keeps the process alive but stops
+  # serving — autoheal catches that case by reacting to Docker's
+  # healthcheck verdict instead of process state.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: chatterly-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "10"        # seconds between scans
+      AUTOHEAL_START_PERIOD: "60"    # grace before first action
+    volumes:
+      # RW socket access — autoheal calls `POST /containers/<id>/restart`
+      # via the docker API. `:ro` on a unix socket gives surprising
+      # behavior across Docker versions; stick with the upstream default.
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"

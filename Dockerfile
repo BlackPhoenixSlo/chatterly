@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1.6
+#
+# OF Relay — runtime image (Python).
+#
+# Mirrors what `./scripts/start.sh` boots natively as `venv/bin/uvicorn
+# service.server:app`, but inside a container so the same artefact runs on
+# your laptop, on a $5/mo VPS (Hetzner / DO / Vultr), or on Railway/Fly.
+#
+# Companion image: app/Dockerfile builds the Next.js /inbox UI.
+# Wired together in docker-compose.yml at the repo root.
+#
+# What is NOT included: anything that drives a real browser (Playwright,
+# capture scripts, dev `--reload` watcher). Auth state arrives via the
+# loginExtension paste-curl flow once the container is running.
+
+FROM python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# curl_cffi ships pre-built libcurl-impersonate wheels for linux/amd64 +
+# linux/arm64, so no compiler toolchain is needed. ca-certificates is for
+# OF + proxy TLS verification. curl backs the HEALTHCHECK below.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps first so the layer caches across code edits.
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+
+# Every service/*.py that server.py imports at runtime, plus the db/ package.
+# Capture-only modules are excluded via .dockerignore (and not listed here).
+COPY service/__init__.py \
+     service/accounts.py \
+     service/capture_session_proxy.py \
+     service/employees.py \
+     service/event_transcoder.py \
+     service/events.py \
+     service/fans.py \
+     service/live_rev.py \
+     service/of_client.py \
+     service/of_signer.py \
+     service/of_ws.py \
+     service/proxies.py \
+     service/server.py \
+     service/session_bootstrap.py \
+     service/
+COPY service/db/ service/db/
+COPY web/ web/
+
+# Persistent state lives outside the image so a rebuild never wipes your
+# auth or your event history. Volume targets:
+#   /app/service/sessions   — captured OF sessions (loginExtension output)
+#   /app/service/proxies.json — proxy registry
+#   /app/service/chatterly.db — SQLite event store (WAL + SHM created beside it)
+RUN mkdir -p /app/service/sessions
+
+EXPOSE 8787
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8787/health > /dev/null || exit 1
+
+# Single worker on purpose — SQLite write lock + the WebSocket pump is a
+# module-level singleton. Production mode, no --reload.
+CMD ["uvicorn", "service.server:app", "--host", "0.0.0.0", "--port", "8787"]
