@@ -24,7 +24,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { useEmployee } from "@/contexts/EmployeeContext";
-import { relay, type Employee } from "@/lib/relay";
+import { relay, RelayError, type Employee } from "@/lib/relay";
 import { cn } from "@/lib/utils";
 
 interface EmployeesResponse { employees: Employee[]; }
@@ -41,6 +41,12 @@ export default function EmployeePickerGate({ children }: { children: React.React
     // The picker is the very first thing rendered; we want a fast spinner,
     // not a 5-min stale guarantee. Override the global default here.
     staleTime: 0,
+    retry: (failureCount, err) => {
+      if (failureCount >= 2) return false;
+      const status = err instanceof RelayError ? err.status : 0;
+      return status === 0 || status >= 500;
+    },
+    retryDelay: (attempt) => Math.min(800 * 2 ** attempt, 3000),
   });
 
   // Sync the fetched roster into context so other components (top-bar
@@ -75,15 +81,18 @@ export default function EmployeePickerGate({ children }: { children: React.React
   // Logged in already → render the app.
   if (current) return <>{children}</>;
 
-  // Persisted pick exists but `current` isn't resolved yet — either
-  // the roster query hasn't landed or its sync-into-context effect
-  // hasn't run yet. Without this, the gate would render the full
-  // picker UI for one frame on every popout open (visible as a "pick
-  // creator" flash before the chat appears). Wait quietly. If the
-  // roster *does* land and pickedId isn't in it (deleted/disabled
-  // employee), `current` will stay null and `roster.length > 0` —
-  // then we fall through to the picker so the user can re-pick.
-  if (pickedId !== null && !current && (query.isLoading || roster.length === 0)) {
+  // Persisted pick exists but `current` isn't resolved yet — wait
+  // quietly only while the roster query is actually in flight, so the
+  // gate doesn't render the picker UI for one frame on every popout
+  // open (visible as a "pick creator" flash before the chat appears).
+  //
+  // We deliberately DO NOT wait on `roster.length === 0`: if the
+  // roster lands empty (fresh install / db wipe), we must fall
+  // through so the picker can render CreateFirstEmployee. Likewise,
+  // if the roster has rows but pickedId isn't among them (deleted /
+  // disabled employee), `current` stays null and we fall through so
+  // the user can re-pick.
+  if (pickedId !== null && !current && query.isLoading) {
     return <div className="min-h-screen flex items-center justify-center text-fg-dim">…</div>;
   }
 
@@ -100,15 +109,78 @@ export default function EmployeePickerGate({ children }: { children: React.React
           <div className="text-fg-dim text-sm py-8 text-center">Loading roster…</div>
         )}
         {query.error && (
-          <div className="text-err text-sm py-4">
-            Couldn&apos;t reach the relay. Make sure it&apos;s running at <code>localhost:8787</code>.
-          </div>
+          <RelayErrorBox
+            error={query.error}
+            onRetry={() => query.refetch()}
+            retrying={query.isFetching}
+          />
         )}
 
         {query.data && (
           <EmployeeList employees={query.data.employees} onPick={pick} onCreated={() => qc.invalidateQueries({ queryKey: ["employees"] })} />
         )}
       </div>
+    </div>
+  );
+}
+
+function RelayErrorBox({
+  error,
+  onRetry,
+  retrying,
+}: {
+  error: unknown;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const isRelayError = error instanceof RelayError;
+  const status = isRelayError ? error.status : null;
+  const message = error instanceof Error ? error.message : String(error);
+  const bodySnippet = (() => {
+    if (!isRelayError) return null;
+    const b = error.body;
+    if (b == null) return null;
+    if (typeof b === "string") return b.slice(0, 600);
+    try { return JSON.stringify(b, null, 2).slice(0, 600); } catch { return null; }
+  })();
+
+  const heading = status
+    ? `Relay returned HTTP ${status}`
+    : "Couldn't reach the relay";
+  const hint = status
+    ? status >= 500
+      ? "The relay is running but crashed on this request. Check its logs."
+      : status === 401 || status === 403
+        ? "Share link is missing or expired. Re-open the share URL."
+        : null
+    : "The Next server couldn't proxy to the relay process. Verify the relay is up.";
+
+  return (
+    <div className="text-err text-sm py-4 space-y-2">
+      <div className="font-semibold">{heading}</div>
+      <div className="text-xs text-fg-dim font-mono break-all">
+        GET {origin}/admin/employees?include_disabled=true
+      </div>
+      {message && (
+        <div className="text-xs">{message}</div>
+      )}
+      {hint && (
+        <div className="text-xs text-fg-dim">{hint}</div>
+      )}
+      {bodySnippet && (
+        <pre className="text-[10px] text-fg-dim bg-bg-elev-1 border border-border rounded p-2 overflow-auto max-h-40 whitespace-pre-wrap break-all">
+{bodySnippet}
+        </pre>
+      )}
+      <button
+        type="button"
+        onClick={onRetry}
+        disabled={retrying}
+        className="text-xs px-3 py-1.5 rounded-lg bg-bg-elev-1 hover:bg-bg-elev-2 border border-border disabled:opacity-50"
+      >
+        {retrying ? "Retrying…" : "Retry"}
+      </button>
     </div>
   );
 }

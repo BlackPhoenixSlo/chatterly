@@ -29,9 +29,19 @@ import { useVaultUpload } from "@/hooks/useVaultMedia";
 import { readUploadPreset } from "@/hooks/useUploadPreset";
 import { resizeImageIfNeeded } from "@/lib/imageResize";
 
+import dynamic from "next/dynamic";
+
 import { EmojiPickerButton, EmojiQuickRow, insertAtCursor } from "./EmojiBar";
 import { TemplatePicker, templateMediaToVault, type PickedTemplate } from "./TemplatePicker";
-import { VaultPicker } from "./VaultPicker";
+
+// VaultPicker is heavy (hover-scrub state, fan-vault-history, wall-media,
+// per-fan MRU localStorage). The composer mounts on every chat surface,
+// but the picker only renders when the chatter clicks 📎. Dynamic +
+// render-gate keeps the picker chunk off the inbox boot bundle.
+const VaultPicker = dynamic(
+  () => import("./VaultPicker").then((m) => m.VaultPicker),
+  { ssr: false },
+);
 
 export interface SendArgs {
   text: string;
@@ -441,7 +451,7 @@ export function Composer({
                   className="relative w-14 h-14 rounded-md overflow-hidden border border-border bg-bg-elev-1 group"
                 >
                   {thumb ? (
-                    <img src={thumb} alt="" className="w-full h-full object-cover" />
+                    <img src={thumb} alt="" loading="lazy" decoding="async" className="w-full h-full object-cover" />
                   ) : (
                     <div className="w-full h-full grid place-items-center text-[10px] text-fg-dim">
                       {m.type}
@@ -612,14 +622,19 @@ export function Composer({
         </div>
       </div>
 
-      <VaultPicker
-        open={pickerOpen}
-        onClose={() => setPickerOpen(false)}
-        accountId={accountId}
-        fanId={fanId}
-        initialSelectedIds={attached.map((m) => m.id)}
-        onConfirm={onPicked}
-      />
+      {/* Render-gated dynamic import: the picker chunk only fetches when
+       *  the user actually opens it. Composer mounts on every chat
+       *  surface so this matters for cold-inbox latency. */}
+      {pickerOpen && (
+        <VaultPicker
+          open={pickerOpen}
+          onClose={() => setPickerOpen(false)}
+          accountId={accountId}
+          fanId={fanId}
+          initialSelectedIds={attached.map((m) => m.id)}
+          onConfirm={onPicked}
+        />
+      )}
     </>
   );
 }

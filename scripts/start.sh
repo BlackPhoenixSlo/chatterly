@@ -120,7 +120,7 @@ elif [[ -d app && -f app/package.json ]] && command -v pnpm >/dev/null 2>&1; the
       # eat the cold-compile delay. Backgrounded — start.sh returns now,
       # warm-up happens in parallel. Retry a few times in case dev is
       # still wiring up its handlers in the first second.
-      WARM_TOKEN="${SHARE_TOKEN:-}"
+      WARM_TOKEN="${SHARE_TOKEN:-kE5uOG47-gNIxmYzn7rSRCsINYUu0g-h}"
       (
         for _ in 1 2 3 4 5; do
           curl -fsS -o /dev/null --max-time 90 \
@@ -182,10 +182,10 @@ if [[ "$want_tunnel" == "true" ]]; then
   }
 fi
 
-# Show the share-token URL. SHARE_TOKEN must be exported by the caller —
-# the relay refuses to gate without one. Generate once with:
-#   export SHARE_TOKEN=$(openssl rand -hex 24)
-TOKEN="${SHARE_TOKEN:-}"
+# Show the share-token URL — the SHARE_TOKEN constant in service/server.py
+# is the stable default; users overriding via env see the new value
+# instantiated when uvicorn read the env, not here.
+TOKEN="$(SHARE_TOKEN_DEFAULT='kE5uOG47-gNIxmYzn7rSRCsINYUu0g-h'; echo "${SHARE_TOKEN:-$SHARE_TOKEN_DEFAULT}")"
 
 # Detect whether the optional Docker capture sidecar is reachable so we can
 # print "remote login enabled" / "remote login disabled" alongside the URLs.

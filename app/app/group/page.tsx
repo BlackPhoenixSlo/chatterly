@@ -20,12 +20,15 @@
  * tab acts on add/focus.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { ChatList, type ChatListSelection } from "@/components/chat/ChatList";
 import { GroupPane } from "@/components/group/GroupPane";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useInboxRealtime } from "@/hooks/useInboxRealtime";
+import type { OFChatItem } from "@/lib/relay";
 import {
   GROUP_CHANNEL_NAME,
   GROUP_HEARTBEAT_MS,
@@ -298,6 +301,50 @@ export default function GroupChatPage() {
     );
   }, []);
 
+  // Unresponded count among loaded panes: derived from whatever chats
+  // data is already in the React Query cache (no extra fetches). SSE
+  // keeps lastMessage current; the cache subscription re-runs this
+  // derivation whenever any ["chats", ...] entry changes.
+  const qc = useQueryClient();
+  const [chatsCacheTick, setChatsCacheTick] = useState(0);
+  useEffect(() => {
+    // Only react to actual data updates. observerAdded/Removed events
+    // fire on every render of subscribers (e.g. ChatList mounted below)
+    // and would otherwise cause an infinite render loop.
+    const unsub = qc.getQueryCache().subscribe((e) => {
+      if (e?.type !== "updated") return;
+      const k = e?.query?.queryKey as readonly unknown[] | undefined;
+      if (k && k[0] === "chats") setChatsCacheTick((t) => t + 1);
+    });
+    return unsub;
+  }, [qc]);
+  const unrespondedCount = useMemo(() => {
+    const byKey = new Map<string, OFChatItem>();
+    const entries = qc.getQueriesData<{ pages: { rows: OFChatItem[] }[] }>({ queryKey: ["chats"] });
+    for (const [, data] of entries) {
+      if (!data?.pages) continue;
+      for (const p of data.pages) for (const c of p.rows) {
+        const k = `${c.__accountId ?? ""}:${c.withUser.id}`;
+        if (!byKey.has(k)) byKey.set(k, c);
+      }
+    }
+    let n = 0;
+    for (const s of slots) {
+      const c = byKey.get(`${s.accountId}:${s.fanId}`);
+      const lm = c?.lastMessage;
+      if (!lm) continue;
+      if (lm.fromUser?.id != null && lm.fromUser.id !== Number(s.accountId)) n++;
+    }
+    return n;
+    // chatsCacheTick is a render trigger so cache patches re-evaluate.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slots, qc, chatsCacheTick]);
+
+  const groupTabTitle = unrespondedCount > 0
+    ? `(${unrespondedCount}) Group`
+    : "Group";
+  useDocumentTitle(groupTabTitle);
+
   const full = slots.length >= GROUP_SLOT_CAP;
   // Responsive grid: panes shrink as count grows. Tailwind picks the
   // narrowest column that still fits ~280px content. At 8 panes on a
@@ -315,7 +362,17 @@ export default function GroupChatPage() {
     <div className="h-[calc(100vh-3.5rem)] grid grid-cols-[300px_minmax(0,1fr)] overflow-hidden">
       <div className="flex flex-col min-h-0 border-r border-border bg-panel">
         <div className="px-3 py-2 border-b border-border flex items-center justify-between gap-2">
-          <div className="text-xs font-semibold">Group chat</div>
+          <div className="text-xs font-semibold flex items-center gap-1.5">
+            <span>Group chat</span>
+            {unrespondedCount > 0 && (
+              <span
+                className="px-1.5 rounded-full bg-warn/20 text-warn text-[10px] font-medium leading-[16px]"
+                title="Loaded panes where the fan sent the last message"
+              >
+                {unrespondedCount} unresponded
+              </span>
+            )}
+          </div>
           <div className="text-[10px] text-fg-dim shrink-0">
             {slots.length} / {GROUP_SLOT_CAP}
           </div>
@@ -333,6 +390,7 @@ export default function GroupChatPage() {
               if (full) return;
               addSlot(sel);
             }}
+            setTabTitle={false}
           />
         </div>
       </div>

@@ -410,7 +410,7 @@ function ToastCard({ t }: { t: Toast }) {
     >
       <div className="w-9 h-9 rounded-full bg-bg-elev-1 overflow-hidden shrink-0 grid place-items-center relative">
         {avatar ? (
-          <img src={avatar} alt="" className="w-full h-full object-cover" />
+          <img src={avatar} alt="" loading="lazy" decoding="async" className="w-full h-full object-cover" />
         ) : (
           <span className="text-[11px] text-fg-dim">
             {(t.user.name || t.user.username || "?").slice(0, 1).toUpperCase()}

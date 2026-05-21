@@ -970,3 +970,94 @@ class Shortcut(Base):
     price_cents: Mapped[int | None] = mapped_column(Integer)
     hotkey: Mapped[str | None] = mapped_column(String)
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+# ── §4.11 Wall-media scan (incremental "posted on wall" tracking) ────
+
+class WallMedia(Base):
+    """Vault media IDs we've ever observed in this model's wall posts.
+    Drives the blue "posted on wall" ring in the VaultPicker.
+
+    Populated incrementally by /admin/vault/wall-media — each call walks
+    OF's /posts feed forward (or backwards during backfill) and upserts
+    rows here. Lookups read the union of every row for the account, so
+    the ring is eventually-correct for prolific creators with >250
+    lifetime posts (the old in-memory cap silently mis-flagged those)."""
+    __tablename__ = "wall_media"
+
+    account_id: Mapped[str] = mapped_column(
+        String, ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True
+    )
+    media_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    post_id: Mapped[int | None] = mapped_column(BigInteger)
+    # Wall-post publishedAt — used during backfill to walk older history
+    # via OF's before_publish_time cursor.
+    post_published_at: Mapped[datetime | None] = mapped_column(DateTime)
+    first_seen_at: Mapped[datetime] = _ts_now()
+
+    # Redundant w/ the composite PK's leading column on SQLite, but kept
+    # so `create_all()` and the Alembic migration produce identical
+    # schemas across fresh-install / migrate paths.
+    __table_args__ = (
+        Index("ix_wall_media_account_id", "account_id"),
+    )
+
+
+class PerfEventRow(Base):
+    """Client-side perfLog events, batch-ingested from the frontend so we
+    can ask things like "across all chatters, what's the p95 from
+    `vault.media requested` → `delivered`?" or "are popout windows on
+    LAN-tunnel hosts slower than direct same-host opens?".
+
+    Append-only. Pruned by `_perf_events_evict_once()` on a background
+    timer (default 7 days; tune via env). No FK to accounts — the
+    employee/account identity is best-effort `meta` payload, since the
+    frontend may not know either at the moment a tab.open fires."""
+    __tablename__ = "perf_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tab_id: Mapped[str] = mapped_column(String, nullable=False)
+    parent_tab_id: Mapped[str | None] = mapped_column(String)
+    op_id: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    phase: Mapped[str] = mapped_column(String, nullable=False)
+    # Client epoch ms — store as BigInteger because raw ms is more useful
+    # than a parsed datetime when reconstructing intra-second sequences
+    # (multiple events can land in the same millisecond).
+    client_ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    received_at: Mapped[datetime] = _ts_now()
+    # Soft identity hints — present when the client knew them at log time.
+    employee_id: Mapped[int | None] = mapped_column(Integer)
+    account_id: Mapped[str | None] = mapped_column(String)
+    # JSON-encoded free-form meta. Capped at INGEST_META_MAX_BYTES
+    # server-side so a runaway logger can't blow the row size.
+    meta_json: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_perf_events_received_at", "received_at"),
+        Index("ix_perf_events_tab_kind", "tab_id", "kind"),
+        Index("ix_perf_events_op", "op_id"),
+    )
+
+
+class WallScanState(Base):
+    """Per-account scan watermark for the wall-media walker. One row per
+    account.
+
+    Two phases:
+      • Backfill (fully_backfilled=False): we haven't seen the bottom of
+        the post feed yet. Subsequent calls walk backward from
+        oldest_post_published_at.
+      • Refresh (fully_backfilled=True): we've reached the bottom. Each
+        call walks forward and stops as soon as it hits a post with
+        publishedAt <= newest_post_published_at."""
+    __tablename__ = "wall_scan_state"
+
+    account_id: Mapped[str] = mapped_column(
+        String, ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True
+    )
+    newest_post_published_at: Mapped[datetime | None] = mapped_column(DateTime)
+    oldest_post_published_at: Mapped[datetime | None] = mapped_column(DateTime)
+    fully_backfilled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime)
+    scanned_posts_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

@@ -126,11 +126,12 @@ app.middleware("http")(_audit_middleware)
 
 # ── Share-link gate ────────────────────────────────────────────
 # Only requests carrying the token via ?t=... or the share_token cookie get
-# through. Set SHARE_TOKEN to any random string before launching the relay,
-# e.g. `export SHARE_TOKEN=$(openssl rand -hex 24)`. To disable the gate
-# entirely (truly local dev, no exposure), launch with SHARE_TOKEN= (empty
-# string). /health is always open so cloudflared / load balancers can probe it.
-SHARE_TOKEN = os.environ.get("SHARE_TOKEN", "").strip()
+# through. The default is a stable test token so the share URL stays the
+# same across `docker compose up`, plain `uvicorn ...`, and
+# `service/run_public.sh`. To disable the gate entirely (truly local dev,
+# no exposure), launch with SHARE_TOKEN= (empty string). /health is always
+# open so cloudflared / load balancers can probe it.
+SHARE_TOKEN = os.environ.get("SHARE_TOKEN", "kE5uOG47-gNIxmYzn7rSRCsINYUu0g-h").strip()
 _SHARE_COOKIE = "share_token"
 
 
@@ -555,6 +556,10 @@ async def _start_event_pumps() -> None:
     # drops anything older than _IMG_CACHE_TTL_S by mtime.
     asyncio.create_task(_img_cache_evictor_loop(), name="img-cache-evictor")
 
+    # Prune of `perf_events` so the client-side perflog ingest table
+    # stays bounded. Retain window via PERFLOG_RETAIN_S (default 7d).
+    asyncio.create_task(_perflog_evictor_loop(), name="perflog-evictor")
+
 
 @app.on_event("shutdown")
 async def _stop_event_pumps() -> None:
@@ -650,12 +655,105 @@ def _invalidate_client(account_id: str) -> None:
     _clients.pop(account_id, None)
 
 
+# ── Per-account OF call priority lanes ────────────────────────────────
+#
+# All OF API calls for one account share a single curl_cffi.requests.Session
+# routed through one proxy IP. curl_cffi Sessions are NOT thread-safe and
+# OF + the proxy provider cap concurrent connections per source IP — so
+# firing 8 parallel /users/list batches behind a 11s /chats/messages call
+# starves anything else (like a vault picker open) that tries to land
+# during that window.
+#
+# We solve this with two semaphores per account:
+#   * `total`      — hard concurrency cap so we never exceed what the
+#                    proxy/OF can serve cleanly
+#   * `background` — sub-cap so bulk enrichment can't fill every slot
+#
+# Background calls acquire BOTH; user calls only the total cap. Result:
+# user-initiated work always has at least (total - background) reserved
+# slots and jumps the queue ahead of any waiting background call.
+#
+# Priority is signalled by the `X-Priority: background` request header.
+# Anything else (including missing) is treated as user.
+_ACCOUNT_LANE_TOTAL = 4
+_ACCOUNT_LANE_BACKGROUND = 2
+_account_lanes_lock = threading.Lock()
+_account_lanes: dict[str, tuple[threading.BoundedSemaphore, threading.BoundedSemaphore]] = {}
+_priority_total_waits: int = 0
+_priority_background_waits: int = 0
+
+
+def _lanes_for(account_id: str) -> tuple[threading.BoundedSemaphore, threading.BoundedSemaphore]:
+    """Return (total, background) semaphores for `account_id`, creating
+    them on first access."""
+    with _account_lanes_lock:
+        pair = _account_lanes.get(account_id)
+        if pair is None:
+            pair = (
+                threading.BoundedSemaphore(_ACCOUNT_LANE_TOTAL),
+                threading.BoundedSemaphore(_ACCOUNT_LANE_BACKGROUND),
+            )
+            _account_lanes[account_id] = pair
+        return pair
+
+
+def _current_priority() -> str:
+    """Read X-Priority off the current request. Defaults to 'user' when
+    the header is missing or the call originates outside a request (e.g.
+    background tasks). The only value that changes behaviour is the exact
+    string 'background'."""
+    req = _request_ctx.get()
+    if req is None:
+        return "user"
+    return (req.headers.get("x-priority") or "user").lower()
+
+
+@contextlib.contextmanager
+def _priority_lane(account_id: str | None):
+    """Acquire the right semaphore(s) for the current request's priority.
+    Background callers also hold the background sub-semaphore, so user
+    callers always have at least (total - background) reserved slots."""
+    global _priority_total_waits, _priority_background_waits
+    if not account_id:
+        yield
+        return
+    total, background = _lanes_for(account_id)
+    priority = _current_priority()
+    bg_held = False
+    if priority == "background":
+        _priority_background_waits += 1
+        background.acquire()
+        bg_held = True
+    _priority_total_waits += 1
+    total.acquire()
+    try:
+        yield
+    finally:
+        try: total.release()
+        except ValueError: pass
+        if bg_held:
+            try: background.release()
+            except ValueError: pass
+
+
 def _proxy(call):
     """Translate OFAPIError + curl_cffi proxy/network errors into a structured
     502 so the frontend can react, and log a one-liner instead of a 200-line
-    traceback for transient proxy failures (cf-tunnel 403s, timeouts, DNS)."""
+    traceback for transient proxy failures (cf-tunnel 403s, timeouts, DNS).
+
+    Also serializes the upstream call through the per-account priority
+    lane, so a bulk background enrichment can't starve a user-initiated
+    fetch (vault open, chat click)."""
     try:
-        return call()
+        aid: str | None = None
+        req = _request_ctx.get()
+        if req is not None:
+            try:
+                aid = _resolve_account_id(req)
+            except HTTPException:
+                aid = None
+        with _priority_lane(aid):
+            return call()
     except OFAPIError as e:
         r = e.response
         status = r.status_code if r is not None else 500
@@ -1063,6 +1161,29 @@ async def admin_errors_create(body: _AppErrorBody = Body(...)) -> dict[str, Any]
         return {"ok": False}
 
 
+@app.delete("/admin/errors")
+async def admin_errors_clear(
+    since_hours: int | None = Query(None, ge=1, le=720, description="Only clear rows within this window; omit to clear all"),
+    source: str | None = Query(None, description="Filter by 'browser' or 'server'"),
+) -> dict[str, Any]:
+    """Dismiss errors — used by the TopNav badge's Clear button. Deletes
+    rows matching the same filter the GET uses so the badge count drops
+    to zero immediately."""
+    from db.engine import get_session
+    from db.models import AppError
+    from sqlalchemy import delete as sa_delete
+    async with get_session() as s:
+        stmt = sa_delete(AppError)
+        if since_hours is not None:
+            cutoff = datetime.utcnow() - timedelta(hours=since_hours)
+            stmt = stmt.where(AppError.occurred_at >= cutoff)
+        if source:
+            stmt = stmt.where(AppError.source == source)
+        result = await s.execute(stmt)
+        await s.commit()
+        return {"ok": True, "deleted": result.rowcount or 0}
+
+
 @app.get("/admin/errors")
 async def admin_errors_list(
     limit: int = Query(50, ge=1, le=500),
@@ -1101,6 +1222,166 @@ async def admin_errors_list(
                 for r in rows
             ],
         }
+
+
+# ── /admin/perflog — client-side timing log ingest ────────────────
+# Frontend `app/lib/perfLog.ts` batches PerfEvents and POSTs them here so
+# we can aggregate "tab open → call asked → call delivered" timing across
+# all chatters. Append-only. Pruned every `_PERFLOG_EVICT_INTERVAL_S` by
+# `_perflog_evictor_loop()` so the table stays bounded.
+
+_PERFLOG_RETAIN_S = int(os.environ.get("PERFLOG_RETAIN_S", str(7 * 24 * 60 * 60)))
+_PERFLOG_EVICT_INTERVAL_S = 60 * 60
+_PERFLOG_BATCH_MAX = 500
+_PERFLOG_META_MAX_BYTES = 4 * 1024
+
+
+class _PerfLogEventBody(BaseModel):
+    opId: str
+    kind: str
+    phase: str
+    ts: float  # client epoch ms (may be sub-ms float from performance.timeOrigin)
+    tabId: str | None = None
+    meta: dict[str, Any] | None = None
+
+
+class _PerfLogIngestBody(BaseModel):
+    tabId: str
+    parentTabId: str | None = None
+    employeeId: int | None = None
+    accountId: str | None = None
+    events: list[_PerfLogEventBody]
+
+
+@app.post("/admin/perflog/ingest")
+async def admin_perflog_ingest(request: Request, body: _PerfLogIngestBody = Body(...)) -> dict[str, Any]:
+    """Persist a batch of client-side perf events. Never raises — if we
+    can't write we still 200 so the client's flush loop doesn't error-on-
+    error. Sent via `navigator.sendBeacon` on page unload, plain
+    `fetch(..., keepalive: true)` otherwise.
+
+    Soft-tags rows with the requesting employee + account from headers
+    when the body didn't carry them, so analytics queries can filter on
+    "who's been seeing slow loads"."""
+    from db.engine import get_session
+    from db.models import PerfEventRow
+
+    if not body.events:
+        return {"ok": True, "inserted": 0}
+    events = body.events[:_PERFLOG_BATCH_MAX]
+
+    # Best-effort identity backfill from headers (employee picker writes
+    # X-Employee-Id on every relayed call; X-Account-Id rides scope).
+    hdr_employee_raw = request.headers.get("x-employee-id")
+    try:
+        hdr_employee_id: int | None = int(hdr_employee_raw) if hdr_employee_raw else None
+    except ValueError:
+        hdr_employee_id = None
+    hdr_account_id = request.headers.get("x-account-id") or None
+
+    employee_id = body.employeeId if body.employeeId is not None else hdr_employee_id
+    account_id = body.accountId if body.accountId else hdr_account_id
+
+    try:
+        async with get_session() as s:
+            for e in events:
+                meta_str: str | None = None
+                if e.meta is not None:
+                    try:
+                        meta_str = json.dumps(e.meta, default=str)[:_PERFLOG_META_MAX_BYTES]
+                    except (TypeError, ValueError):
+                        meta_str = None
+                # The body tabId is per-batch; fall back to per-event if a
+                # client ever wants to ship cross-tab batches (today they
+                # don't — but keeping the schema honest).
+                tab_id = (e.tabId or body.tabId)[:64]
+                s.add(PerfEventRow(
+                    tab_id=tab_id,
+                    parent_tab_id=body.parentTabId[:64] if body.parentTabId else None,
+                    op_id=(e.opId or "")[:128],
+                    kind=(e.kind or "")[:64],
+                    phase=(e.phase or "")[:32],
+                    client_ts_ms=int(e.ts),
+                    employee_id=employee_id,
+                    account_id=account_id[:64] if account_id else None,
+                    meta_json=meta_str,
+                ))
+            await s.commit()
+        return {"ok": True, "inserted": len(events)}
+    except Exception:
+        log.exception("perflog ingest failed")
+        return {"ok": False}
+
+
+@app.get("/admin/perflog/recent")
+async def admin_perflog_recent(
+    limit: int = Query(200, ge=1, le=2000),
+    since_minutes: int = Query(60, ge=1, le=24 * 60 * 7),
+    kind: str | None = Query(None, description="Filter by event kind (exact match)"),
+    tab_id: str | None = Query(None, description="Filter to a single tab session"),
+    op_id: str | None = Query(None, description="Filter to a single op id (all phases)"),
+) -> dict[str, Any]:
+    """Recent perfLog events, newest first. Powers ad-hoc inspection of
+    timing across chatters — e.g. histogram of `vault.media` request→
+    delivered deltas, or per-tab "open → first useful paint" times."""
+    from db.engine import get_session
+    from db.models import PerfEventRow
+    from sqlalchemy import select
+
+    cutoff = datetime.utcnow() - timedelta(minutes=since_minutes)
+    async with get_session() as s:
+        stmt = select(PerfEventRow).where(PerfEventRow.received_at >= cutoff)
+        if kind:
+            stmt = stmt.where(PerfEventRow.kind == kind)
+        if tab_id:
+            stmt = stmt.where(PerfEventRow.tab_id == tab_id)
+        if op_id:
+            stmt = stmt.where(PerfEventRow.op_id == op_id)
+        stmt = stmt.order_by(PerfEventRow.received_at.desc()).limit(limit)
+        rows = (await s.execute(stmt)).scalars().all()
+        return {
+            "count": len(rows),
+            "since_minutes": since_minutes,
+            "list": [
+                {
+                    "id": r.id,
+                    "tab_id": r.tab_id,
+                    "parent_tab_id": r.parent_tab_id,
+                    "op_id": r.op_id,
+                    "kind": r.kind,
+                    "phase": r.phase,
+                    "client_ts_ms": r.client_ts_ms,
+                    "received_at": r.received_at.isoformat() + "Z",
+                    "employee_id": r.employee_id,
+                    "account_id": r.account_id,
+                    "meta": json.loads(r.meta_json) if r.meta_json else None,
+                }
+                for r in rows
+            ],
+        }
+
+
+async def _perflog_evictor_loop() -> None:
+    """Periodic prune of perf_events older than _PERFLOG_RETAIN_S. Cheap —
+    indexed on received_at. Runs hourly by default; tune via env."""
+    from db.engine import get_session
+    from db.models import PerfEventRow
+    from sqlalchemy import delete as sa_delete
+    while True:
+        try:
+            await asyncio.sleep(_PERFLOG_EVICT_INTERVAL_S)
+            cutoff = datetime.utcnow() - timedelta(seconds=_PERFLOG_RETAIN_S)
+            async with get_session() as s:
+                res = await s.execute(
+                    sa_delete(PerfEventRow).where(PerfEventRow.received_at < cutoff)
+                )
+                await s.commit()
+                if (res.rowcount or 0) > 0:
+                    log.info("perflog evictor pruned %d rows (retain=%ds)", res.rowcount, _PERFLOG_RETAIN_S)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.warning("perflog evictor cycle failed", exc_info=True)
 
 
 # ── /admin/chats/recent — instant-load seed for the inbox ──────────
@@ -1175,7 +1456,7 @@ def proxy_image(request: Request, u: str = Query(..., description="Absolute OF C
         if hit is not None:
             _img_cache_hits += 1
             bin_p, ct_cached = hit
-            cache_control = "public, max-age=172800, stale-while-revalidate=86400, immutable"
+            cache_control = "public, max-age=604800, stale-while-revalidate=86400, immutable"
             return FileResponse(
                 str(bin_p),
                 media_type=ct_cached,
@@ -1225,11 +1506,12 @@ def proxy_image(request: Request, u: str = Query(..., description="Absolute OF C
     # OF's CDN sends short Cache-Control because the signed Policy expires,
     # but the IMAGE BYTES themselves don't expire. We override upstream's
     # header to keep the browser HTTP cache (and a future Service Worker)
-    # holding the asset for 2 days — once we've fetched the bytes, the
-    # upstream signature is irrelevant for serving them again.
-    # SWR window of 1 day lets the SW serve a stale copy instantly while
-    # silently refreshing in the background.
-    cache_control = "public, max-age=172800, stale-while-revalidate=86400, immutable"
+    # holding the asset for 7 days — matches the disk-cache TTL above so
+    # the browser doesn't re-fetch bytes we still have on disk. Once we've
+    # fetched the bytes, the upstream signature is irrelevant for serving
+    # them again. SWR window of 1 day lets the SW serve a stale copy
+    # instantly while silently refreshing in the background.
+    cache_control = "public, max-age=604800, stale-while-revalidate=86400, immutable"
     out_headers = {"Cache-Control": cache_control}
     # Stable hash exposed back to the browser so the frontend can pivot
     # to /img/by-hash/<h> on subsequent renders — same image, same key,
@@ -1715,12 +1997,12 @@ def _storyboard_extract_batch(
     4-frame batch vs. one subprocess per frame. Frames write directly to
     their final 0-based name.
 
-    Tolerates partial success: short clips with rounded-up duration
-    metadata will fail the last seek at/past EOF; we keep whatever did
-    land and backfill the rest from the nearest neighbour so the
-    storyboard is always complete-shaped. Returns False only if zero
-    frames came out — that's the case where the source mp4 is unreadable
-    or the timeout fired."""
+    Tolerates partial success: if ffmpeg returns non-zero (common when
+    the final frame's seek lands at/past EOF on short clips with
+    rounded-up duration metadata) but at least one jpg landed on disk,
+    we treat the batch as good. Returns False only if zero frames came
+    out — that's the case where the source mp4 is unreadable or the
+    timeout fired."""
     import subprocess
     # Stay at least 100ms before the encoded EOF — ffmpeg can't seek past
     # the last decodable frame, and short clips whose container metadata
@@ -1905,7 +2187,7 @@ def proxy_image_scrub(
         frame_path,
         media_type="image/jpeg",
         headers={
-            "Cache-Control": "public, max-age=172800, immutable",
+            "Cache-Control": "public, max-age=604800, immutable",
             "X-Img-Hash": h,
         },
     )
@@ -3881,46 +4163,113 @@ async def admin_vault_sends_backfill(body: _VaultBackfillBody = Body(...)) -> di
     return {"ok": True, "inserted": inserted, "skipped": skipped}
 
 
+def _parse_of_iso(s: Any) -> datetime | None:
+    """OF's postedAt is "2026-04-12T17:33:11+00:00"-ish. Returns a naive
+    UTC datetime (matches the rest of our DB convention) or None."""
+    if not isinstance(s, str):
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
 @app.get("/admin/vault/wall-media")
 async def admin_vault_wall_media(
     request: Request,
     account_id: str = Query(...),
-    pages: int = Query(5, ge=1, le=20, description="Max post pages to walk."),
+    pages: int = Query(5, ge=1, le=20, description="Max OF /posts pages to walk per call."),
     limit: int = Query(50, ge=1, le=50, description="Posts per page."),
+    force: bool = Query(False, description="Force a re-scan from the top, ignoring the cached watermarks. UI's '↻ refresh' button."),
 ) -> dict[str, Any]:
-    """Aggregate every vault media id that appears in this model's wall
-    posts. Walks OF's /users/{my_id}/posts feed page-by-page using the
-    tailMarker cursor; capped at `pages × limit` posts so a creator with
-    thousands of posts doesn't hang the request.
+    """Aggregate every vault media id ever posted on this model's wall,
+    backed by SQLite (`wall_media` + `wall_scan_state`) so subsequent
+    calls are O(diff-since-last-scan) instead of the old 5-page
+    (~250-post) re-walk every hour.
 
-    Returns:
-      { "media_ids": [int, ...] }   sorted ascending for stable hashing
-      { "scanned_posts": int }
-      { "has_more": bool }          true if we stopped at the page cap
+    Two operating modes (state per-account in `wall_scan_state`):
+      • Backfill: walks BACKWARD from `oldest_post_published_at` using
+        OF's beforePublishTime cursor. Used until we hit the bottom of
+        the post feed; `pages` per call so creators with thousands of
+        posts amortize the walk over several picker opens.
+      • Refresh: once `fully_backfilled=True`, walks FORWARD from the
+        top and stops at the post matching `newest_post_published_at`.
+        Usually a single page round-trip — creators rarely post 50
+        wall items between picker opens.
 
-    Frontend uses this to draw the 'posted on wall' ring around vault
-    tiles. Pure read — no DB writes — we lean on the PersistQueryClient
-    layer for caching at the frontend so the first paint of every chat
-    is instant after one warm load."""
+    Returns the UNION of every media_id we've ever recorded for this
+    account plus scan status. `has_more=true` means DB coverage is
+    incomplete (older history remains) — the frontend uses it to
+    optionally trigger another fetch in the background.
+
+    The OF httpx calls (`client.me()`, `client.user_posts(...)`) are
+    blocking; we run each via `asyncio.to_thread` so the event loop
+    stays responsive — the up-to-5 sequential page walks otherwise
+    froze SSE / webhooks for the full duration (observed 13.5s in the
+    wild). `request.is_disconnected()` checks between pages so a folder
+    switch mid-walk frees the per-account proxy slot promptly."""
+    from db.engine import get_session
+    from db.models import WallMedia, WallScanState
+    from sqlalchemy import select
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
     client = _load_client(account_id)
-    me_resp = client.me()
+    me_resp = await asyncio.to_thread(client.me)
     my_id = me_resp.get("id")
     if not isinstance(my_id, int):
         raise HTTPException(status_code=500, detail="Could not resolve current user id from /users/me")
 
-    media_ids: set[int] = set()
-    before: str | None = None
+    # 1. Load scan state; honor `force` by wiping watermarks (rows stay —
+    #    re-walking just re-confirms what we know via on_conflict_do_nothing).
+    async with get_session() as s:
+        state = (await s.execute(
+            select(WallScanState).where(WallScanState.account_id == account_id)
+        )).scalar_one_or_none()
+        if force and state is not None:
+            state.newest_post_published_at = None
+            state.oldest_post_published_at = None
+            state.fully_backfilled = False
+            await s.flush()
+        # Snapshot the values we need outside the session (state row is
+        # detached after the `async with` exits).
+        prev_newest = state.newest_post_published_at if state else None
+        prev_oldest = state.oldest_post_published_at if state else None
+        prev_backfilled = bool(state.fully_backfilled) if state else False
+        prev_total = int(state.scanned_posts_total) if state else 0
+
+    # 2. Pick mode + cursor. Three cases:
+    #    • first   — never scanned this account before, walk forward from top.
+    #    • refresh — fully covered already, walk forward and stop at watermark.
+    #    • backfill — middle: walk backward from oldest known post.
+    if prev_newest is None and prev_oldest is None:
+        mode = "first"
+        before: str | None = None
+        stop_forward_at: datetime | None = None
+    elif prev_backfilled:
+        mode = "refresh"
+        before = None
+        stop_forward_at = prev_newest
+    else:
+        mode = "backfill"
+        before = (
+            f"{prev_oldest.timestamp():.6f}"
+            if prev_oldest is not None else None
+        )
+        stop_forward_at = None
+
+    # 3. Walk pages, accumulating new (account, media, post, published_at).
+    new_rows: list[dict[str, Any]] = []
+    seen_media_in_call: set[int] = set()  # dedupe within this call's batch
     scanned = 0
-    has_more = False
+    page_newest_ts: datetime | None = None
+    page_oldest_ts: datetime | None = None
+    hit_known_top = False
+    of_has_more = False
     for _ in range(pages):
-        # Bail out as soon as the client disconnects (e.g. user switched
-        # vault folder mid-walk and the browser aborted the fetch).
-        # Without this, the loop would walk all 5 OF pages while the
-        # newly-issued vault-media call queues behind it on the per-
-        # account proxy, blocking the user's interaction by 10–15s.
         if await request.is_disconnected():
             raise HTTPException(status_code=499, detail="client disconnected")
-        resp = client.user_posts(
+        resp = await asyncio.to_thread(
+            client.user_posts,
             my_id,
             limit=limit,
             skip_users="all",
@@ -3932,20 +4281,108 @@ async def admin_vault_wall_media(
             break
         scanned += len(posts)
         for post in posts:
+            pid = post.get("id")
+            posted_at = _parse_of_iso(post.get("postedAt") or post.get("postedAtPrecise"))
+            if posted_at and (page_newest_ts is None or posted_at > page_newest_ts):
+                page_newest_ts = posted_at
+            if posted_at and (page_oldest_ts is None or posted_at < page_oldest_ts):
+                page_oldest_ts = posted_at
+            # Refresh-mode stop: posts older-than-or-equal-to the watermark
+            # are already in our DB. Don't enqueue their media (we have
+            # them) and flag the outer loop to bail.
+            if mode == "refresh" and stop_forward_at and posted_at and posted_at <= stop_forward_at:
+                hit_known_top = True
+                continue
             for m in (post.get("media") or []):
                 mid = m.get("id")
-                if isinstance(mid, int) and mid > 0:
-                    media_ids.add(mid)
-        has_more = bool(resp.get("hasMore"))
-        if not has_more:
+                if isinstance(mid, int) and mid > 0 and mid not in seen_media_in_call:
+                    seen_media_in_call.add(mid)
+                    new_rows.append({
+                        "account_id": account_id,
+                        "media_id": mid,
+                        "post_id": int(pid) if isinstance(pid, int) else None,
+                        "post_published_at": posted_at,
+                    })
+        of_has_more = bool(resp.get("hasMore"))
+        if hit_known_top:
+            break
+        if not of_has_more:
             break
         before = resp.get("tailMarker")
         if not before:
             break
+
+    # 4. Persist new rows + scan state, then read the full union back.
+    now = datetime.utcnow()
+    new_fully_backfilled = prev_backfilled
+    if mode == "first":
+        new_fully_backfilled = not of_has_more
+    elif mode == "backfill" and not of_has_more:
+        new_fully_backfilled = True
+    # refresh mode never flips back to False — force=True is the only path
+    # that resets the watermarks.
+
+    # Merge watermarks: extend in whichever direction this call walked.
+    new_newest = page_newest_ts
+    if prev_newest is not None and (new_newest is None or prev_newest > new_newest):
+        new_newest = prev_newest
+    new_oldest = page_oldest_ts
+    if prev_oldest is not None and (new_oldest is None or prev_oldest < new_oldest):
+        new_oldest = prev_oldest
+
+    new_total = prev_total + scanned
+
+    async with get_session() as s:
+        # Ensure the parent accounts row exists — wall_media + wall_scan_state
+        # both FK to accounts.id. Without import_legacy ever running for this
+        # account, the FK insert blows up. Idempotent ON CONFLICT no-op.
+        from db.models import Account
+        await s.execute(
+            sqlite_insert(Account)
+            .values(id=account_id, is_active_default=False)
+            .on_conflict_do_nothing(index_elements=["id"])
+        )
+        if new_rows:
+            await s.execute(
+                sqlite_insert(WallMedia)
+                .values(new_rows)
+                .on_conflict_do_nothing(index_elements=["account_id", "media_id"])
+            )
+        await s.execute(
+            sqlite_insert(WallScanState)
+            .values(
+                account_id=account_id,
+                newest_post_published_at=new_newest,
+                oldest_post_published_at=new_oldest,
+                fully_backfilled=new_fully_backfilled,
+                last_scan_at=now,
+                scanned_posts_total=new_total,
+            )
+            .on_conflict_do_update(
+                index_elements=["account_id"],
+                set_={
+                    "newest_post_published_at": new_newest,
+                    "oldest_post_published_at": new_oldest,
+                    "fully_backfilled": new_fully_backfilled,
+                    "last_scan_at": now,
+                    "scanned_posts_total": new_total,
+                },
+            )
+        )
+        all_ids_rows = (await s.execute(
+            select(WallMedia.media_id).where(WallMedia.account_id == account_id)
+        )).scalars().all()
+
     return {
-        "media_ids": sorted(media_ids),
+        "media_ids": sorted({int(x) for x in all_ids_rows}),
         "scanned_posts": scanned,
-        "has_more": has_more,
+        "new_media_count": len(new_rows),
+        "has_more": not new_fully_backfilled,
+        "fully_backfilled": new_fully_backfilled,
+        "mode": mode,
+        "last_scan_at": now.isoformat() + "Z",
+        "newest_post_published_at": new_newest.isoformat() + "Z" if new_newest else None,
+        "oldest_post_published_at": new_oldest.isoformat() + "Z" if new_oldest else None,
     }
 
 

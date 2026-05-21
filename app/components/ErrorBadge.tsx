@@ -11,7 +11,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { relay } from "@/lib/relay";
 import { fmtRelTime, cn } from "@/lib/utils";
@@ -36,6 +36,17 @@ interface ErrorListResp {
 export function ErrorBadge() {
   const [open, setOpen] = useState(false);
   const popRef = useRef<HTMLDivElement | null>(null);
+  const qc = useQueryClient();
+  const clear = useMutation({
+    mutationFn: () => relay.delete<{ ok: boolean; deleted: number }>("/admin/errors?since_hours=24"),
+    onSuccess: () => {
+      qc.setQueryData<ErrorListResp>(["app-errors", "recent"], (prev) =>
+        prev ? { ...prev, count: 0, list: [] } : prev,
+      );
+      qc.invalidateQueries({ queryKey: ["app-errors", "recent"] });
+      setOpen(false);
+    },
+  });
 
   // Defer the first /admin/errors fetch by ~1s so it doesn't compete
   // with the chat-list fetch for relay threads on cold load. The badge
@@ -87,10 +98,23 @@ export function ErrorBadge() {
       </button>
       {open && (
         <div className="absolute right-0 mt-1 w-[420px] max-h-[60vh] bg-panel border border-border rounded-lg shadow-xl z-40 flex flex-col">
-          <header className="px-3 py-2 border-b border-border flex items-center justify-between">
+          <header className="px-3 py-2 border-b border-border flex items-center justify-between gap-2">
             <div className="text-sm font-semibold">Recent errors</div>
-            <div className="text-[11px] text-fg-dim">
-              {count} in {q.data?.since_hours ?? 24}h
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-fg-dim">
+                {count} in {q.data?.since_hours ?? 24}h
+              </span>
+              {count > 0 && (
+                <button
+                  type="button"
+                  onClick={() => clear.mutate()}
+                  disabled={clear.isPending}
+                  className="text-[11px] px-2 py-0.5 rounded border border-border bg-bg-elev-1 hover:bg-bg-elev-2 text-fg-dim hover:text-fg disabled:opacity-50"
+                  title="Dismiss all errors from the last 24h"
+                >
+                  {clear.isPending ? "Clearing…" : "Clear"}
+                </button>
+              )}
             </div>
           </header>
           <div className="flex-1 overflow-y-auto">

@@ -12,9 +12,9 @@ cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
 PORT="${PORT:-8787}"
-# SHARE_TOKEN must be exported before running this script. Generate one with:
-#   export SHARE_TOKEN=$(openssl rand -hex 24)
-TOKEN="${SHARE_TOKEN:?set SHARE_TOKEN before running run_public.sh}"
+# Default token is stable so the share URL doesn't churn across restarts.
+# Override with SHARE_TOKEN=... ./service/run_public.sh to rotate.
+TOKEN="${SHARE_TOKEN:-kE5uOG47-gNIxmYzn7rSRCsINYUu0g-h}"
 LOG_DIR="$REPO_ROOT/.run_public"
 mkdir -p "$LOG_DIR"
 TUNNEL_LOG="$LOG_DIR/cloudflared.log"

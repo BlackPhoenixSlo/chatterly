@@ -30,3 +30,4 @@ my_Curl_session.example
 of_calls_tail.txt
 errors
 bookmark_error_curl
+__pycache__/

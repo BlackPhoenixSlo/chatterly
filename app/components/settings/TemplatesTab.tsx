@@ -305,7 +305,7 @@ export default function TemplatesTab() {
                     className="relative w-14 h-14 rounded-md overflow-hidden border border-border bg-bg-elev-1 group"
                   >
                     {thumb ? (
-                      <img src={thumb} alt="" className="w-full h-full object-cover" />
+                      <img src={thumb} alt="" loading="lazy" decoding="async" className="w-full h-full object-cover" />
                     ) : (
                       <div className="w-full h-full grid place-items-center text-[10px] text-fg-dim">
                         {m.type}
@@ -535,7 +535,7 @@ function MediaStrip({
         return (
           <div key={m.id} className="w-10 h-10 rounded border border-border overflow-hidden bg-bg-elev-1">
             {thumb ? (
-              <img src={thumb} alt="" className="w-full h-full object-cover" />
+              <img src={thumb} alt="" loading="lazy" decoding="async" className="w-full h-full object-cover" />
             ) : (
               <div className="w-full h-full grid place-items-center text-[9px] text-fg-dim">
                 {m.type ?? "?"}

@@ -27,7 +27,7 @@ export function useAccounts() {
   return useQuery<AccountsResp>({
     queryKey: ["accounts"],
     queryFn: () => relay.get<AccountsResp>("/admin/accounts"),
-    staleTime: 60_000,
+    staleTime: 3 * 24 * 60 * 60_000,
     refetchOnWindowFocus: false,
   });
 }

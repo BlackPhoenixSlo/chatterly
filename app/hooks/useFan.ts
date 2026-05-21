@@ -24,7 +24,7 @@ export function useFan(accountId: string | null, fanId: number | null) {
     enabled: !!accountId && fanId != null,
     queryFn: () =>
       relay.get<FanRecord>(`/admin/fans/${accountId}/${fanId}`),
-    staleTime: 30_000,
+    staleTime: Infinity,
     refetchOnWindowFocus: false,
   });
 

@@ -24,6 +24,7 @@ import { useFanVaultHistory, type FanVaultEntry } from "@/hooks/useFanVaultHisto
 import { useWallMedia } from "@/hooks/useWallMedia";
 import { useBlurMode, blurImageClass } from "@/hooks/useBlurMode";
 import { proxyImage, proxyScrubFrame, type VaultMedia } from "@/lib/relay";
+import { perfLog, perfOpId, perfPainted } from "@/lib/perfLog";
 
 // Hover-preview slideshow tuning. 12 evenly-spaced frames @ 600ms each
 // cycles a full video clip in 7.2 seconds — comfortable scrub speed and
@@ -175,31 +176,52 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
 
   const vault = useVaultMedia({ accountId, type, listId, enabled: open });
   const listsQ = useVaultLists(accountId, open);
-  // Per-fan history only matters when a fan is in scope. The query is
-  // cheap (local sqlite) so we fire as soon as the picker opens.
-  const historyQ = useFanVaultHistory(accountId, fanId ?? null, open);
-  const historyMap = historyQ.data?.by_media ?? {};
-  // Wall-posted ids drive the blue ring. Pure decoration, never blocking.
-  // Gate the fetch so it doesn't fire alongside the initial vault load —
-  // we wait until vault has finished its INITIAL fetch (isLoading=false)
-  // before kicking off the ~15s post-walk. Once we flip to ready, we stay
-  // ready for the rest of this open: tearing down a half-finished
-  // wall-media on every folder switch / background refetch was the bug
-  // — the walk never got to finish before being cancelled again, so the
-  // rings would never appear (or only flash before vanishing).
-  // Closing the picker resets so the next open re-gates on its own
-  // initial vault load.
-  const [wallReady, setWallReady] = useState(false);
+
+  // Log vault.open `delivered` the first time the initial fetch lands this
+  // open-session. Subsequent loads (filter switch, infinite scroll) are
+  // tracked independently by useVaultMedia / useVaultLists.
+  const deliveredRef = useRef(false);
   useEffect(() => {
     if (!open) {
-      setWallReady(false);
+      deliveredRef.current = false;
       return;
     }
-    if (wallReady) return;
+    if (deliveredRef.current) return;
     if (vault.isLoading) return;
-    setWallReady(true);
-  }, [open, vault.isLoading, wallReady]);
-  const wall = useWallMedia(accountId, open && wallReady);
+    const id = openOpIdRef.current;
+    if (!id) return;
+    deliveredRef.current = true;
+    perfLog(id, "vault.open", "delivered", {
+      itemCount: vault.items.length,
+      hadError: !!vault.error,
+    });
+  }, [open, vault.isLoading, vault.items.length, vault.error]);
+  // `cosmeticReady` flips true once the initial vault.media has landed
+  // for this open. It gates both the wall-media post-walk AND the per-fan
+  // history fetch — both are pure decoration (status ring color, corner
+  // price pill) and must NOT compete with the user-blocking vault page
+  // load. Once we flip to ready, we stay ready for the rest of this open
+  // so the cosmetics fill in naturally as filters change. (Tearing down
+  // a half-finished wall-media on every folder switch / background
+  // refetch was the original bug — the walk never got to finish before
+  // being cancelled again, so the rings would never appear.)
+  // Closing the picker resets so the next open re-gates on its own
+  // initial vault load.
+  const [cosmeticReady, setCosmeticReady] = useState(false);
+  useEffect(() => {
+    if (!open) {
+      setCosmeticReady(false);
+      return;
+    }
+    if (cosmeticReady) return;
+    if (vault.isLoading) return;
+    setCosmeticReady(true);
+  }, [open, vault.isLoading, cosmeticReady]);
+  // Per-fan history paints the status ring + corner pill — defer until
+  // cosmeticReady so it doesn't queue alongside the initial vault page.
+  const historyQ = useFanVaultHistory(accountId, fanId ?? null, open && cosmeticReady);
+  const historyMap = historyQ.data?.by_media ?? {};
+  const wall = useWallMedia(accountId, open && cosmeticReady);
   const [blurMode] = useBlurMode();
   const blurCls = blurImageClass(blurMode);
   // Hover-to-preview is a 12-frame slideshow served by the relay's
@@ -367,6 +389,14 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
     setHoveredVideoId((cur) => (cur === id ? null : cur));
   };
 
+  // Perf instrumentation. We mint a fresh open-op id every time the picker
+  // transitions closed→open and stamp it onto the vault-media + vault-lists
+  // hooks so their requested/delivered phases share the same id as the
+  // user-visible "vault open" event. The first-tile painted milestone is
+  // logged from the tile <button> below via a render-once ref.
+  const openOpIdRef = useRef<string | null>(null);
+  const paintedRef = useRef(false);
+
   // Reset selection state when the picker transitions from closed → open.
   // Parent passes a fresh `initialSelectedIds` array on every render, so
   // depending on its identity would clobber in-picker selections on every
@@ -374,6 +404,10 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
   const wasOpenRef = useRef(false);
   useEffect(() => {
     if (open && !wasOpenRef.current) {
+      const id = perfOpId("vault.open");
+      openOpIdRef.current = id;
+      paintedRef.current = false;
+      perfLog(id, "vault.open", "requested", { accountId, fanId });
       setSelectedIds(new Set(initialSelectedIds));
       setSelectedMeta(new Map());
       // Restore the whole picker position for this fan: folder, sort,
@@ -613,6 +647,19 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
           </select>
 
           <div className="ml-auto flex items-center gap-3">
+            {/* Wall-scan indicator: only render while coverage is
+             *  incomplete so the user understands the blue "posted on
+             *  wall" ring is still filling in. Once `fullyBackfilled`
+             *  flips, we stay silent — no point shouting a steady
+             *  state. */}
+            {wall.hasMore && (
+              <span
+                className="text-[11px] text-fg-dim italic"
+                title="The 'posted on wall' ring is being filled in across vault opens. Older posts will get marked on subsequent picker opens."
+              >
+                {wall.isFetching ? "scanning wall…" : "wall scan incomplete"}
+              </span>
+            )}
             <button
               type="button"
               onClick={() => vault.refresh()}
@@ -687,7 +734,7 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
           )}
 
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2">
-            {visibleItems.map((m) => {
+            {visibleItems.map((m, tileIdx) => {
               const selected = selectedIds.has(m.id);
               const rawThumb =
                 m.files?.thumb?.url ||
@@ -725,9 +772,21 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
               const fanEntry = fanId != null ? historyMap[String(m.id)] : undefined;
               const onWall = wall.set.has(m.id);
               const status = resolveStatus(fanEntry, onWall);
+              const onFirstTileRef = (el: HTMLButtonElement | null) => {
+                if (!el || tileIdx !== 0) return;
+                if (paintedRef.current) return;
+                const id = openOpIdRef.current;
+                if (!id) return;
+                paintedRef.current = true;
+                // Fires the moment the first tile <button> is mounted —
+                // this is "first tab open" in the user's terms: the
+                // picker has data on screen and is clickable.
+                perfPainted(id, "vault.open", { firstTileId: m.id });
+              };
               return (
                 <button
                   key={m.id}
+                  ref={onFirstTileRef}
                   type="button"
                   onClick={() => toggle(m)}
                   onMouseEnter={m.type === "video" ? () => startHoverIntent(m.id, m.duration ?? 0, rawVideoSrc) : undefined}

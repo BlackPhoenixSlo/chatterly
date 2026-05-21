@@ -436,7 +436,7 @@ function Row({
     <>
       <div className="w-7 h-7 rounded-full bg-bg-elev-1 overflow-hidden shrink-0 grid place-items-center">
         {avatar ? (
-          <img src={avatar} alt="" className="w-full h-full object-cover" />
+          <img src={avatar} alt="" loading="lazy" decoding="async" className="w-full h-full object-cover" />
         ) : (
           <span className="text-[10px] text-fg-dim">
             {(user.name || user.username || "?").slice(0, 1).toUpperCase()}

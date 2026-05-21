@@ -35,7 +35,7 @@ export function useAllChatFolders(accountId: string | null) {
   return useQuery({
     queryKey: ["chat-folders", accountId ?? "", "all"],
     enabled: !!accountId,
-    staleTime: 5 * 60_000,
+    staleTime: 3 * 24 * 60 * 60_000,
     queryFn: async (): Promise<ChatFolder[]> => {
       if (!accountId) return [];
       const r = await relay.get<FoldersResp>(
@@ -59,7 +59,7 @@ export function useChatFolders(accountId: string | null) {
   return useQuery({
     queryKey: ["chat-folders", accountId ?? "", "pinned"],
     enabled: !!accountId,
-    staleTime: 5 * 60_000,
+    staleTime: 3 * 24 * 60 * 60_000,
     queryFn: async (): Promise<ChatFolder[]> => {
       if (!accountId) return [];
       const r = await relay.get<FoldersResp>(

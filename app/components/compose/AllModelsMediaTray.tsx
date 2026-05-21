@@ -70,8 +70,15 @@ export function AllModelsMediaTray({
                   <img
                     src={blob}
                     alt={f.name}
+                    decoding="async"
                     className="w-full h-full object-cover"
-                    onLoad={() => URL.revokeObjectURL(blob)}
+                    onLoad={() => {
+                      // Defer revoke off the decode callback so we don't
+                      // pay sync GC inside the paint frame. The browser
+                      // still has the blob bound to this <img>'s active
+                      // src; revoking after a microtask is safe.
+                      queueMicrotask(() => URL.revokeObjectURL(blob));
+                    }}
                   />
                 ) : (
                   <div className="w-full h-full grid place-items-center text-[10px] text-fg-dim text-center px-1">

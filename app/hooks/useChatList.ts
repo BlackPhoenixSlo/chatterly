@@ -19,6 +19,7 @@ import { useInfiniteQuery, useQueryClient, type QueryClient } from "@tanstack/re
 
 import { useScope } from "@/contexts/ScopeContext";
 import { relay, type OFChatItem, type OFChatsResp, type OFUserMini } from "@/lib/relay";
+import { perfDelivered, perfError, perfLog, perfOpId } from "@/lib/perfLog";
 import { useActiveAccounts } from "./useAccounts";
 
 const PAGE_SIZE = 25;
@@ -54,27 +55,33 @@ function normalizeChats(resp: OFChatsResp, accountId: string): OFChatItem[] {
   });
 }
 
-/** OF's /chats only returns `{withUser: {id, _view}}`. Batch-fetch real
- *  names/avatars via /users/list (max 50 ids per call) and merge.
+/** OF's /chats only returns `{withUser: {id, _view}}`. We enrich names/
+ *  avatars in two passes:
  *
- *  Also writes each enriched profile to the per-fan `["of-user", aid, fid]`
- *  query cache. ChatList rows observe that cache at render time, so even
- *  if the chats cache later gets overwritten with slim rows (refetch, SSE
- *  patch, etc.), the rail label keeps the enriched name + custom nickname.
- *  The cache is keyed per-fan with stable identity, so refetches of the
- *  chat list don't touch it. */
+ *  (1) **Local SQLite first.** One cheap `/admin/fans/{aid}/by-ids` call
+ *      against our `fans` table — the WS transcoder writes names+avatars
+ *      whenever a message lands, so any fan the model has ever talked to
+ *      is already there. This pass is INSTANT and pays zero upstream cost.
+ *
+ *  (2) **Fill the gaps from OF.** Only ids we have no local row for hit
+ *      `/users/list`, in chunks of 50 (OF's hard limit). The first chunk
+ *      runs eagerly so visible-but-unknown fans get a name fast; the
+ *      rest are awaited sequentially to avoid the 8-parallel storm that
+ *      was throttling the vault picker. Every OF call carries
+ *      `priority: "background"` so a user-initiated fetch (vault open,
+ *      chat click) jumps the queue ahead via the relay's lane semaphore.
+ *
+ *  Profiles land in the per-fan `["of-user", aid, fid]` query cache. The
+ *  ChatList row observes that cache, so even when chats refetches drop a
+ *  slim version of the row, the rail label keeps the enriched name. */
 async function enrichWithUsers(
   chats: OFChatItem[],
   accountId: string,
   qc: QueryClient,
 ): Promise<OFChatItem[]> {
   if (chats.length === 0) return chats;
-  // Dedup ids and chunk by 50 — OF's hard limit for the batch endpoint.
   const ids = Array.from(new Set(chats.map((c) => c.withUser.id))).filter(Boolean);
   if (ids.length === 0) return chats;
-
-  const chunks: number[][] = [];
-  for (let i = 0; i < ids.length; i += 50) chunks.push(ids.slice(i, i + 50));
 
   const byId = new Map<number, {
     id: number;
@@ -85,15 +92,68 @@ async function enrichWithUsers(
     lastSeen?: string | null;
     customNickname?: string | null;
   }>();
-  await Promise.all(
-    chunks.map(async (chunk) => {
+
+  // ── Pass 1: local SQLite (zero upstream) ────────────────────────────
+  try {
+    const qs = new URLSearchParams();
+    qs.set("ids", ids.join(","));
+    const local = await relay.get<{
+      fans: Record<string, {
+        id: number;
+        name: string | null;
+        username: string | null;
+        avatar: string | null;
+        customNickname: string | null;
+      }>;
+    }>(`/admin/fans/${accountId}/by-ids?${qs.toString()}`);
+    for (const [k, f] of Object.entries(local.fans || {})) {
+      const nid = Number(k);
+      if (!Number.isFinite(nid)) continue;
+      // Treat a row as "useful" only if it has at least a display name.
+      // A bare row with just an id wouldn't save the OF round-trip.
+      if (!f.name && !f.username) continue;
+      const profile = {
+        id: nid,
+        name: f.name ?? undefined,
+        username: f.username ?? undefined,
+        avatar: f.avatar ?? null,
+        customNickname: f.customNickname ?? null,
+      };
+      byId.set(nid, profile);
+      qc.setQueryData<Record<string, unknown> | undefined>(
+        ["of-user", accountId, nid],
+        (prev) => ({
+          ...(prev ?? {}),
+          id: nid,
+          name: profile.name,
+          username: profile.username,
+          avatar: profile.avatar,
+          customNickname:
+            profile.customNickname
+            ?? (prev as { customNickname?: string | null } | undefined)?.customNickname
+            ?? null,
+        }),
+      );
+    }
+  } catch (err) {
+    // Local lookup failing isn't fatal — we'll just hit OF for everything.
+    console.warn("[chats] local fans/by-ids failed", err);
+  }
+
+  // ── Pass 2: fill gaps from OF (background priority, sequential) ─────
+  const missing = ids.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    const chunks: number[][] = [];
+    for (let i = 0; i < missing.length; i += 50) chunks.push(missing.slice(i, i + 50));
+
+    const fetchChunk = async (chunk: number[]) => {
       const qs = new URLSearchParams();
       for (const id of chunk) qs.append("ids", String(id));
       qs.set("view", "m");
       try {
         const resp = await relay.get<UserListResp>(
           `/api/of/v2/users/list?${qs.toString()}`,
-          { accountId },
+          { accountId, priority: "background" },
         );
         for (const [k, u] of Object.entries(resp || {})) {
           const nid = Number(k);
@@ -108,17 +168,6 @@ async function enrichWithUsers(
             customNickname: u.customNickname ?? null,
           };
           byId.set(nid, profile);
-          // Stable per-fan cache. Survives any subsequent chats refetch
-          // because the key is (accountId, fanId), not the chats list key.
-          // MERGE rather than replace: `useOFUser` keys on the same
-          // ["of-user", aid, fid] but stores the rich profile (incl.
-          // subscribedOnData + listsStates) that backs FanDrawer's live
-          // spend grid and ChatActionsMenu's lists submenu. A bare
-          // replace here would wipe those fields on every 60s chats
-          // refetch / SSE patch and the panel would go blank until
-          // staleTime expired. Spreading prev preserves rich data
-          // already in cache; if none exists, we still seed the slim
-          // shape the ChatList rail wants.
           qc.setQueryData<Record<string, unknown> | undefined>(
             ["of-user", accountId, nid],
             (prev) => ({
@@ -135,12 +184,20 @@ async function enrichWithUsers(
           );
         }
       } catch (err) {
-        // Best-effort: a single chunk failing shouldn't blank the inbox.
-        // Rows for those ids will fall back to "fan <id>".
+        // One chunk failing shouldn't blank the rest of the inbox.
         console.warn("[chats] enrich users/list failed", err);
       }
-    }),
-  );
+    };
+
+    // First chunk eagerly (so the visible top of the list lands fast);
+    // the rest awaited sequentially so we never pile more than one
+    // background /users/list onto the relay's per-account lane at a time.
+    await fetchChunk(chunks[0]);
+    for (let i = 1; i < chunks.length; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await fetchChunk(chunks[i]);
+    }
+  }
 
   return chats.map((c) => {
     const u = byId.get(c.withUser.id);
@@ -185,15 +242,31 @@ async function fetchPage(
   if (query) qs.set("query", query);
   const path = `/api/of/v2/chats?${qs.toString()}`;
 
+  // Per-page perf op. offset=0 is "load messages" / first paint; offset>0
+  // is "load next N messages" via infinite scroll. We log filter/listId/
+  // query so a slow filter switch is identifiable.
+  const opId = perfOpId("chat.list");
+  perfLog(opId, "chat.list", "requested", {
+    scope: scope.kind, offset, limit, filter, listId, query,
+    phase: offset === 0 ? "initial" : "page",
+    accountCount: scope.kind === "all" ? accounts.length : 1,
+  });
+
   if (scope.kind === "model") {
-    const resp = await relay.get<OFChatsResp>(path, { accountId: scope.accountId });
-    const raw = normalizeChats(resp, scope.accountId);
-    // Kick off enrichment in the BACKGROUND so the rail paints immediately.
-    // Enrichment writes per-fan profiles to the ["of-user", aid, fid] cache;
-    // the row component observes that cache and picks up names + nicknames
-    // as soon as /users/list lands. Don't await — that would slow cold paint.
-    void enrichWithUsers(raw, scope.accountId, qc).catch(() => {});
-    return { rows: raw.sort(compareChats), hasMore: !!resp.hasMore };
+    try {
+      const resp = await relay.get<OFChatsResp>(path, { accountId: scope.accountId });
+      const raw = normalizeChats(resp, scope.accountId);
+      perfDelivered(opId, "chat.list", { count: raw.length, hasMore: !!resp.hasMore });
+      // Kick off enrichment in the BACKGROUND so the rail paints immediately.
+      // Enrichment writes per-fan profiles to the ["of-user", aid, fid] cache;
+      // the row component observes that cache and picks up names + nicknames
+      // as soon as /users/list lands. Don't await — that would slow cold paint.
+      void enrichWithUsers(raw, scope.accountId, qc).catch(() => {});
+      return { rows: raw.sort(compareChats), hasMore: !!resp.hasMore };
+    } catch (err) {
+      perfError(opId, "chat.list", { message: (err as Error)?.message });
+      throw err;
+    }
   }
 
   // Unified: each account independently paginates at this offset. We treat
@@ -210,12 +283,18 @@ async function fetchPage(
   );
   const merged: OFChatItem[] = [];
   let anyMore = false;
+  let failed = 0;
   for (const r of results) {
     if (r.status === "fulfilled") {
       merged.push(...r.value.raw);
       if (r.value.hasMore) anyMore = true;
+    } else {
+      failed += 1;
     }
   }
+  perfDelivered(opId, "chat.list", {
+    count: merged.length, hasMore: anyMore, accountCount: accounts.length, failed,
+  });
   return { rows: merged.sort(compareChats), hasMore: anyMore };
 }
 

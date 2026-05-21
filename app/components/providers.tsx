@@ -42,15 +42,18 @@ import { EmployeeProvider } from "@/contexts/EmployeeContext";
 import { ScopeProvider } from "@/contexts/ScopeContext";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { installGlobalErrorHandlers } from "@/lib/errorReporter";
+import { perfBoot } from "@/lib/perfLog";
 import { registerImageSW } from "@/lib/registerImageSW";
 
 // Bump when the persisted cache shape changes (added/removed fields on
 // OFChatItem, etc.) so old localStorage entries get nuked on read instead
 // of silently rendering as garbage.
 const CACHE_BUSTER = "v3";
-// 24h is generous — popout windows usually open within minutes, but the
-// snapshot is fine to keep around in case a chatter restarts their tab.
-const PERSIST_MAX_AGE = 24 * 60 * 60 * 1000;
+// 7d covers Mon-open / Wed-reopen — chatters want their threads/vault
+// still warm after a day or two off without paying the full re-fetch
+// cost. Must stay ≤ default gcTime below, otherwise a query would be
+// GC'd before its persisted copy expires.
+const PERSIST_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 
 // Keys we want shared across tabs. Anything not on this list stays
 // in-memory only.
@@ -81,11 +84,15 @@ export default function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(() => new QueryClient({
     defaultOptions: {
       queries: {
-        // Mirror the desktop-app's 5-min TTL. Per-query overrides happen
-        // at the useQuery call site when a domain needs different (chat
-        // list 30s, vault metadata 1h, online presence 30s, etc.)
-        staleTime: 5 * 60 * 1000,
-        gcTime:    30 * 60 * 1000,
+        // Treat everything as fresh for 3 days by default — chatters
+        // re-open the tab across days and we don't want to re-fetch
+        // half the inbox each time. Per-query overrides at the useQuery
+        // call site for things that genuinely need freshness (chat list
+        // 30s, online presence 30s, etc.)
+        staleTime: 3 * 24 * 60 * 60 * 1000,
+        // 7d to match PERSIST_MAX_AGE — keeps queries alive in memory
+        // for as long as their persisted copy is valid.
+        gcTime:    7 * 24 * 60 * 60 * 1000,
         // Don't refetch on window focus — feels noisy with SSE already
         // keeping things live. Re-enable per-query if a screen needs it.
         refetchOnWindowFocus: false,
@@ -111,6 +118,11 @@ export default function Providers({ children }: { children: React.ReactNode }) {
     // SW for image caching — no-op in dev, lazy register in prod. See
     // IMAGE_LOAD_PLAN.txt phase C.
     registerImageSW();
+    // Side-effect import: perfLog's module-evaluation mints the tabId
+    // and emits the `tab open` event. The call itself is a no-op; we
+    // just want the import to land in the boot bundle so the open
+    // event fires before lazy-loaded hooks first drag perfLog in.
+    perfBoot();
   }, []);
 
   useEffect(() => {

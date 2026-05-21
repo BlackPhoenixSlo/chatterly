@@ -8,6 +8,7 @@
  */
 
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
@@ -17,8 +18,20 @@ import { cn } from "@/lib/utils";
 import ScopeSwitcher from "@/components/ScopeSwitcher";
 import { NotificationBell } from "@/components/NotificationBell";
 import { ErrorBadge } from "@/components/ErrorBadge";
-import { PostComposer } from "@/components/compose/PostComposer";
-import { MassMessageComposer } from "@/components/compose/MassMessageComposer";
+
+// PostComposer + MassMessageComposer mount in TopNav (so they're on every
+// page), but the user only sees them when they pick "New post" / "Mass
+// message" from the +New dropdown. Statically importing them pulled the
+// vault picker + media tray cascade into the initial bundle on every
+// route; dynamic import + render-gated keeps the chunk off boot.
+const PostComposer = dynamic(
+  () => import("@/components/compose/PostComposer").then((m) => m.PostComposer),
+  { ssr: false },
+);
+const MassMessageComposer = dynamic(
+  () => import("@/components/compose/MassMessageComposer").then((m) => m.MassMessageComposer),
+  { ssr: false },
+);
 
 const LINKS: Array<{ href: string; label: string }> = [
   { href: "/",          label: "Home"     },
@@ -141,8 +154,10 @@ export default function TopNav() {
         </div>
       </div>
 
-      <PostComposer open={postOpen} onClose={() => setPostOpen(false)} />
-      <MassMessageComposer open={massOpen} onClose={() => setMassOpen(false)} />
+      {/* Render-gate the dynamic imports: until the user actually opens
+       *  one of the composers, the chunk never even fetches. */}
+      {postOpen && <PostComposer open={postOpen} onClose={() => setPostOpen(false)} />}
+      {massOpen && <MassMessageComposer open={massOpen} onClose={() => setMassOpen(false)} />}
     </header>
   );
 }

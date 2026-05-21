@@ -17,6 +17,7 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 
 import { useChatList } from "@/hooks/useChatList";
 import { useActiveAccounts } from "@/hooks/useAccounts";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useFanSpend } from "@/hooks/useFanSpend";
 import { useFanDrawerDefault } from "@/hooks/useFanDrawerDefault";
 import { useBlurMode } from "@/hooks/useBlurMode";
@@ -63,10 +64,14 @@ export interface ChatListSelection {
 }
 
 export function ChatList({
-  selected, onSelect,
+  selected, onSelect, setTabTitle = true,
 }: {
   selected: ChatListSelection | null;
   onSelect: (sel: ChatListSelection) => void;
+  /** When true (default) ChatList writes "(N) Chatterly" into document.title
+   *  based on the All-set attention count. Pages that want a different
+   *  tab-title format (e.g. /group) opt out and set their own. */
+  setTabTitle?: boolean;
 }) {
   const { scope } = useScope();
   const accounts = useActiveAccounts();
@@ -229,15 +234,61 @@ export function ChatList({
   // our court — but extended to include unread chats (which also imply
   // they sent last).
   const oweReplyActive = active.kind === "builtin" && active.key === "owe-reply";
+  const isUnresponded = useCallback((c: OFChatItem) => {
+    const accountId = c.__accountId ?? (scope.kind === "model" ? scope.accountId : "");
+    const myId = Number(accountId);
+    const lm = c.lastMessage;
+    return !!lm && lm.fromUser?.id != null && lm.fromUser.id !== myId;
+  }, [scope]);
   const rows = useMemo(() => {
     if (!oweReplyActive) return allRows;
-    return allRows.filter((c) => {
-      const accountId = c.__accountId ?? (scope.kind === "model" ? scope.accountId : "");
-      const myId = Number(accountId);
-      const lm = c.lastMessage;
-      return !!lm && lm.fromUser?.id != null && lm.fromUser.id !== myId;
-    });
-  }, [allRows, oweReplyActive, scope]);
+    return allRows.filter(isUnresponded);
+  }, [allRows, oweReplyActive, isUnresponded]);
+
+  // Chip counts — derived from already-cached data, zero new fetches.
+  // useChatList re-renders ChatList whenever SSE patches the chats cache
+  // (useInboxRealtime patches EVERY ["chats", ...] cache, including the
+  // active one we subscribe to), so reading qc.getQueryData at render
+  // time picks up fresh values without an extra subscription.
+  const accountKey =
+    scope.kind === "model"
+      ? scope.accountId
+      : accounts.map((a) => a.id).sort().join(",");
+  // 25 = useChatList's PAGE_SIZE default; mirror it so the cache key matches.
+  const allFilterKey = useMemo(
+    () => ["chats", scope.kind, accountKey, null, null, query || null, 25] as const,
+    [scope.kind, accountKey, query],
+  );
+  const allChipBase = useMemo<OFChatItem[]>(() => {
+    // When the All filter is the active query, the live rows ARE the all set.
+    if (active.kind === "builtin" && active.key === "all") return allRows;
+    const cached = qc.getQueryData<{ pages: { rows: OFChatItem[] }[] }>(allFilterKey);
+    if (!cached?.pages) return [];
+    const out: OFChatItem[] = [];
+    const seen = new Set<string>();
+    for (const p of cached.pages) for (const c of p.rows) {
+      const k = `${c.__accountId ?? ""}:${c.withUser.id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(c);
+    }
+    return out;
+  }, [active, allRows, qc, allFilterKey]);
+  const activeCount = useMemo(
+    () => rows.filter((c) => c.hasUnread || isUnresponded(c)).length,
+    [rows, isUnresponded],
+  );
+  const allCount = useMemo(
+    () => allChipBase.filter((c) => c.hasUnread || isUnresponded(c)).length,
+    [allChipBase, isUnresponded],
+  );
+  const oweReplyCount = useMemo(
+    () => allChipBase.filter(isUnresponded).length,
+    [allChipBase, isUnresponded],
+  );
+
+  const inboxTabTitle = allCount > 0 ? `(${allCount}) Chatterly` : "Chatterly";
+  useDocumentTitle(inboxTabTitle, setTabTitle);
 
   // Deferred: pass empty inputs until the staggered ready flags flip,
   // which short-circuits the inner useQueries fan-out and keeps the cold
@@ -487,22 +538,27 @@ export function ChatList({
           <FilterChip
             active={active.kind === "builtin" && active.key === "all"}
             onClick={() => setActive({ kind: "builtin", key: "all" })}
+            count={allCount}
           >All</FilterChip>
           <FilterChip
             active={active.kind === "builtin" && active.key === "unread"}
             onClick={() => setActive({ kind: "builtin", key: "unread" })}
+            count={active.kind === "builtin" && active.key === "unread" ? activeCount : null}
           >Unread</FilterChip>
           <FilterChip
             active={active.kind === "builtin" && active.key === "pinned"}
             onClick={() => setActive({ kind: "builtin", key: "pinned" })}
+            count={active.kind === "builtin" && active.key === "pinned" ? activeCount : null}
           >📌 Pinned</FilterChip>
           <FilterChip
             active={active.kind === "builtin" && active.key === "priority"}
             onClick={() => setActive({ kind: "builtin", key: "priority" })}
+            count={active.kind === "builtin" && active.key === "priority" ? activeCount : null}
           >⚡ Priority</FilterChip>
           <FilterChip
             active={active.kind === "builtin" && active.key === "owe-reply"}
             onClick={() => setActive({ kind: "builtin", key: "owe-reply" })}
+            count={oweReplyCount}
             title="Chats where the fan sent the last message and we haven't replied"
           >↩ Owe reply</FilterChip>
         </div>
@@ -519,6 +575,7 @@ export function ChatList({
                   active={isActive}
                   onClick={() => setActive({ kind: "folder", listId: id })}
                   title={f.name || `List #${id}`}
+                  count={isActive ? activeCount : null}
                 >
                   📂 {f.name || `List #${id}`}
                 </FilterChip>
@@ -768,26 +825,38 @@ export function ChatList({
 }
 
 function FilterChip({
-  active, onClick, children, title,
+  active, onClick, children, title, count,
 }: {
   active: boolean;
   onClick: () => void;
   children: React.ReactNode;
   title?: string;
+  count?: number | null;
 }) {
+  const showCount = count != null && count > 0;
   return (
     <button
       type="button"
       onClick={onClick}
       title={title}
       className={cn(
-        "px-2 py-0.5 rounded-full border transition-colors whitespace-nowrap shrink-0",
+        "px-2 py-0.5 rounded-full border transition-colors whitespace-nowrap shrink-0 inline-flex items-center gap-1",
         active
           ? "bg-accent/15 text-accent border-accent/30"
           : "bg-transparent text-fg-dim border-border hover:border-border-light",
       )}
     >
-      {children}
+      <span>{children}</span>
+      {showCount && (
+        <span
+          className={cn(
+            "px-1 min-w-[16px] text-center rounded-full text-[10px] leading-[14px]",
+            active ? "bg-accent/30 text-accent" : "bg-bg-elev-1 text-fg-dim",
+          )}
+        >
+          {count}
+        </span>
+      )}
     </button>
   );
 }

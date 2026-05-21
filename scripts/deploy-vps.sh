@@ -147,16 +147,23 @@ else
 fi
 
 # ---------- 6. SHARE_TOKEN ----------
-say "generating SHARE_TOKEN and writing ~/$REMOTE_DIR/.env on the host"
-SHARE_TOKEN=$(openssl rand -hex 24)
-"${SSH[@]}" bash -s <<REMOTE
+# Preserve an existing token across redeploys so URLs already shared with
+# people don't die on every push. Only mint a new one if .env is missing.
+say "ensuring ~/$REMOTE_DIR/.env exists (preserves existing SHARE_TOKEN)"
+NEW_TOKEN=$(openssl rand -hex 24)
+SHARE_TOKEN=$("${SSH[@]}" bash -s <<REMOTE
 set -euo pipefail
 cd "\$HOME/$REMOTE_DIR"
-# Compose reads .env automatically. Use single-quotes inside printf so no
-# shell expansion happens on the host.
-printf 'SHARE_TOKEN=%s\n' '$SHARE_TOKEN' > .env
-chmod 600 .env
+if [ -s .env ] && grep -q '^SHARE_TOKEN=' .env; then
+  # Reuse existing token. Just print it back so we can echo it locally.
+  grep '^SHARE_TOKEN=' .env | cut -d= -f2-
+else
+  printf 'SHARE_TOKEN=%s\n' '$NEW_TOKEN' > .env
+  chmod 600 .env
+  echo '$NEW_TOKEN'
+fi
 REMOTE
+)
 
 # ---------- 7. compose up + wait for tunnel URL ----------
 say "docker compose --profile tunnel up -d --build (first build can take a few minutes)"

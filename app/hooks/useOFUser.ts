@@ -65,7 +65,7 @@ export function useOFUser(accountId: string, fanId: number) {
     enabled: !!accountId && !!fanId,
     queryFn: () =>
       relay.get<OFUser>(`/api/of/v2/users/${fanId}`, { accountId }),
-    staleTime: 5 * 60_000,
+    staleTime: 3 * 24 * 60 * 60_000,
     refetchOnWindowFocus: true,
   });
 }

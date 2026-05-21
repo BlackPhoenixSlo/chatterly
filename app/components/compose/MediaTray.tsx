@@ -107,7 +107,7 @@ export function MediaTray({
                 className="relative w-16 h-16 rounded-md overflow-hidden border border-border bg-bg-elev-1"
               >
                 {thumb ? (
-                  <img src={thumb} alt="" className="w-full h-full object-cover" />
+                  <img src={thumb} alt="" loading="lazy" decoding="async" className="w-full h-full object-cover" />
                 ) : (
                   <div className="w-full h-full grid place-items-center text-[10px] text-fg-dim">
                     {m.type}

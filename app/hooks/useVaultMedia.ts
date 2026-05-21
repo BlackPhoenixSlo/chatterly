@@ -13,6 +13,7 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { relay, type VaultList, type VaultListsResp, type VaultMedia, type VaultMediaResp, type VaultUploadResp } from "@/lib/relay";
+import { perfDelivered, perfError, perfLog, perfOpId } from "@/lib/perfLog";
 
 const PAGE = 24;
 
@@ -40,11 +41,21 @@ export function useVaultLists(accountId: string | null, enabled = true) {
   return useQuery<VaultListsResp>({
     queryKey: ["vault-lists", accountId],
     enabled: enabled && !!accountId,
-    queryFn: () =>
-      relay.get<VaultListsResp>(
-        "/api/of/v2/vault/lists?view=main&limit=50",
-        { accountId: accountId ?? undefined },
-      ),
+    queryFn: async () => {
+      const opId = perfOpId("vault.lists");
+      perfLog(opId, "vault.lists", "requested", { accountId });
+      try {
+        const r = await relay.get<VaultListsResp>(
+          "/api/of/v2/vault/lists?view=main&limit=50",
+          { accountId: accountId ?? undefined },
+        );
+        perfDelivered(opId, "vault.lists", { count: (r.list ?? []).length });
+        return r;
+      } catch (err) {
+        perfError(opId, "vault.lists", { message: (err as Error)?.message });
+        throw err;
+      }
+    },
     staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
     select: (d) => ({
@@ -79,15 +90,35 @@ export function useVaultMedia(opts: UseVaultMediaOpts) {
       params.set("offset", String(pageParam ?? 0));
       params.set("type", type);
       if (listId != null) params.set("list_id", String(listId));
+      // Per-fetch perf op. `vault.media` covers the initial fetch (the one
+      // the user feels as "vault open"), filter switches (a fresh fetch
+      // under a new queryKey), and infinite-scroll page loads. We tag the
+      // op with offset so the log distinguishes them at a glance.
+      const offset = (pageParam as number) ?? 0;
+      const opId = perfOpId("vault.media");
+      perfLog(opId, "vault.media", "requested", {
+        accountId, type, listId, offset, phase: offset === 0 ? "initial" : "page",
+      });
       // Forward the abort signal so switching folder/type cancels the
       // previous page fetch instead of letting it land into a stale key.
-      return relay.get<VaultMediaResp>(
-        `/api/of/v2/vault/media?${params.toString()}`,
-        { accountId: accountId ?? undefined },
-        signal,
-      );
+      try {
+        const r = await relay.get<VaultMediaResp>(
+          `/api/of/v2/vault/media?${params.toString()}`,
+          { accountId: accountId ?? undefined },
+          signal,
+        );
+        perfDelivered(opId, "vault.media", {
+          count: (r.list ?? []).length, hasMore: !!r.hasMore, offset,
+        });
+        return r;
+      } catch (err) {
+        perfError(opId, "vault.media", {
+          message: (err as Error)?.message, offset, aborted: signal?.aborted,
+        });
+        throw err;
+      }
     },
-    staleTime: 60_000,
+    staleTime: 3 * 24 * 60 * 60_000,
   });
 
   const items: VaultMedia[] = (q.data?.pages ?? []).flatMap((p) => p.list ?? []);

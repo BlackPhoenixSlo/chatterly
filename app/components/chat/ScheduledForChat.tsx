@@ -93,6 +93,8 @@ export function ScheduledForChat({
                       <img
                         src={proxyImage(firstThumb, accountId)}
                         alt=""
+                        loading="lazy"
+                        decoding="async"
                         className="w-10 h-10 rounded object-cover border border-border shrink-0"
                       />
                     )}

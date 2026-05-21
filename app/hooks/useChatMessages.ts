@@ -21,6 +21,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
 
 import { relay, type OFMessage, type OFMessagesResp } from "@/lib/relay";
+import { perfDelivered, perfError, perfLog, perfOpId } from "@/lib/perfLog";
 
 // 30 matches OF's own chat-list page size — enough that most chats need
 // at most one or two scroll-up fetches before reaching the start.
@@ -58,20 +59,34 @@ export function useChatMessages({ accountId, fanId, enabled = true }: UseChatMes
     enabled: enabled && !!accountId && fanId != null,
     queryFn: async ({ signal }) => {
       if (!accountId || fanId == null) return [];
-      // Forward the abort signal so switching chats fast cancels the
-      // previous fetch in flight (frees the relay slot, drops the
-      // payload before it returns).
-      const resp = await relay.get<OFMessagesResp>(
-        `/api/of/v2/chats/${fanId}/messages?limit=${PAGE_SIZE}&order=desc`,
-        { accountId },
-        signal,
-      );
-      // OF returns newest-first. Reverse so the UI can scroll oldest→newest
-      // top-to-bottom (the way humans read a thread).
-      const list = (resp.list || []).slice().reverse();
-      oldestCursorRef.current = list.find((m) => Number(m.id) > 0)?.id as number ?? null;
-      setHasMore(!!resp.hasMore);
-      return list;
+      const opId = perfOpId("chat.messages");
+      perfLog(opId, "chat.messages", "requested", {
+        accountId, fanId, phase: "initial", limit: PAGE_SIZE,
+      });
+      try {
+        // Forward the abort signal so switching chats fast cancels the
+        // previous fetch in flight (frees the relay slot, drops the
+        // payload before it returns).
+        const resp = await relay.get<OFMessagesResp>(
+          `/api/of/v2/chats/${fanId}/messages?limit=${PAGE_SIZE}&order=desc`,
+          { accountId },
+          signal,
+        );
+        // OF returns newest-first. Reverse so the UI can scroll oldest→newest
+        // top-to-bottom (the way humans read a thread).
+        const list = (resp.list || []).slice().reverse();
+        oldestCursorRef.current = list.find((m) => Number(m.id) > 0)?.id as number ?? null;
+        setHasMore(!!resp.hasMore);
+        perfDelivered(opId, "chat.messages", {
+          count: list.length, hasMore: !!resp.hasMore, phase: "initial",
+        });
+        return list;
+      } catch (err) {
+        perfError(opId, "chat.messages", {
+          message: (err as Error)?.message, aborted: signal?.aborted, phase: "initial",
+        });
+        throw err;
+      }
     },
     staleTime: STALE_MS,
     refetchInterval: enabled ? POLL_MS : false,
@@ -95,6 +110,10 @@ export function useChatMessages({ accountId, fanId, enabled = true }: UseChatMes
 
     inflightRef.current = true;
     setIsLoadingOlder(true);
+    const opId = perfOpId("chat.messages");
+    perfLog(opId, "chat.messages", "requested", {
+      accountId, fanId, phase: "older", before_id: oldest, limit: PAGE_SIZE,
+    });
     try {
       const resp = await relay.get<OFMessagesResp>(
         `/api/of/v2/chats/${fanId}/messages?limit=${PAGE_SIZE}&order=desc&before_id=${oldest}`,
@@ -102,6 +121,9 @@ export function useChatMessages({ accountId, fanId, enabled = true }: UseChatMes
       );
       const older = (resp.list || []).slice().reverse();
       setHasMore(!!resp.hasMore);
+      perfDelivered(opId, "chat.messages", {
+        count: older.length, hasMore: !!resp.hasMore, phase: "older",
+      });
       if (older.length === 0) return { added: 0, hasMore: !!resp.hasMore };
 
       qc.setQueryData<OFMessage[]>(queryKey, (prev = []) => {
@@ -110,6 +132,9 @@ export function useChatMessages({ accountId, fanId, enabled = true }: UseChatMes
         return [...dedup, ...prev];
       });
       return { added: older.length, hasMore: !!resp.hasMore };
+    } catch (err) {
+      perfError(opId, "chat.messages", { message: (err as Error)?.message, phase: "older" });
+      throw err;
     } finally {
       inflightRef.current = false;
       setIsLoadingOlder(false);

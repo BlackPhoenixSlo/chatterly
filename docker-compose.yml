@@ -32,11 +32,9 @@ services:
     ports:
       - "127.0.0.1:8787:8787"
     environment:
-      # Required. Generate one once and export it before `docker compose up`:
-      #   export SHARE_TOKEN=$(openssl rand -hex 24)
-      # Anyone who has this token can hit /ui/?t=<token> and act as your
-      # captured OF account, so treat it like a password.
-      SHARE_TOKEN: "${SHARE_TOKEN:?set SHARE_TOKEN before docker compose up}"
+      # Same default token as start.sh prints. Override per-boot with
+      #   SHARE_TOKEN=$(openssl rand -hex 24) docker compose up -d
+      SHARE_TOKEN: "${SHARE_TOKEN:-kE5uOG47-gNIxmYzn7rSRCsINYUu0g-h}"
       # Where the video scrub storyboard cache lives. Bind-mounted below
       # so it persists across container restarts — without this every
       # `docker compose down` wipes hours of accumulated extracts and

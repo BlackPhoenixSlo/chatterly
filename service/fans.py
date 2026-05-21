@@ -25,9 +25,26 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.engine import get_session
-from db.models import Fan, Transaction
+from db.models import Account, Fan, Transaction
+
+
+async def _ensure_account_row(s: AsyncSession, account_id: str) -> None:
+    """Insert a minimal accounts row if missing. The FS-based account
+    registry (sessions/accounts/<id>/) is the source of truth for who's
+    logged in, but the DB `accounts` table only gets populated by
+    `import_legacy` or explicit calls. Without a row here, any FK→accounts
+    insert (fans, transactions, etc.) raises IntegrityError. Idempotent —
+    safe to call on every write path that touches account-scoped tables."""
+    stmt = (
+        sqlite_insert(Account)
+        .values(id=account_id, is_active_default=False)
+        .on_conflict_do_nothing(index_elements=["id"])
+    )
+    await s.execute(stmt)
 
 log = logging.getLogger("of-relay.fans")
 router = APIRouter()
@@ -76,21 +93,6 @@ def _safe_load_list(raw: str | None) -> list[str]:
         return []
 
 
-@router.get("/admin/fans/{account_id}/{fan_id}")
-async def get_fan(account_id: str, fan_id: int) -> dict[str, Any]:
-    """Return the fan row. Creates an empty stub on first access so the
-    drawer always has a row to edit — avoids 404-then-create dance from
-    the UI."""
-    async with get_session() as s:
-        f = await s.get(Fan, (account_id, fan_id))
-        if f is None:
-            f = Fan(account_id=account_id, fan_id=fan_id, source="onlyfans")
-            s.add(f)
-            await s.commit()
-            await s.refresh(f)
-        return _row_to_dict(f)
-
-
 class FanUpdateBody(BaseModel):
     custom_nickname: str | None = Field(None, description="Set null to clear")
     notes: str | None = None
@@ -103,27 +105,13 @@ class FanUpdateBody(BaseModel):
     fetishes: str | None = None
 
 
-@router.patch("/admin/fans/{account_id}/{fan_id}")
-async def update_fan(
-    account_id: str, fan_id: int, body: FanUpdateBody = Body(...),
-) -> dict[str, Any]:
-    """Partial update. Only fields explicitly present in the body are
-    written; null is a deliberate clear, omission is "leave alone"."""
-    payload = body.model_dump(exclude_unset=True)
-    async with get_session() as s:
-        f = await s.get(Fan, (account_id, fan_id))
-        if f is None:
-            f = Fan(account_id=account_id, fan_id=fan_id, source="onlyfans")
-            s.add(f)
-        for k, v in payload.items():
-            if k == "tags":
-                f.tags = json.dumps(v or [])
-            else:
-                setattr(f, k, v)
-        f.updated_at = datetime.utcnow()
-        await s.commit()
-        await s.refresh(f)
-        return _row_to_dict(f)
+# NOTE: route order matters. FastAPI matches paths in declaration order
+# and falls through on path-param TYPE failure — so the literal-third-
+# segment routes (`by-ids`, `spend-batch`) MUST be declared BEFORE the
+# int-parameter route `/{fan_id}`, otherwise "by-ids" gets matched as
+# fan_id, fails int parsing, and returns 422 ("Input should be a valid
+# integer"). The single-segment `/admin/fans/{account_id}` route can
+# live anywhere — its shape doesn't collide.
 
 
 @router.get("/admin/fans/{account_id}")
@@ -140,6 +128,56 @@ async def list_recent_fans(account_id: str, limit: int = 50) -> dict[str, Any]:
         )
         rows = (await s.execute(q)).scalars().all()
         return {"fans": [_row_to_dict(r) for r in rows]}
+
+
+@router.get("/admin/fans/{account_id}/by-ids")
+async def fans_by_ids(
+    account_id: str,
+    ids: str = Query("", description="Comma-separated fan ids (max 200)"),
+) -> dict[str, Any]:
+    """Bulk identity lookup against our LOCAL SQLite `fans` table.
+
+    Returns `{fans: {fan_id_str: {id, name, username, avatar}}}` for every id
+    we have a row for. Missing ids are omitted; the caller decides whether
+    to back-fill from OF /users/list (paying the upstream cost) or accept
+    the gap. Avatars come from the WS transcoder, which writes them
+    whenever a message lands — covers anyone the model has talked to.
+
+    Used by the chat-list enrichment to instantly paint names+avatars
+    from local data instead of firing 8 parallel /users/list batches on
+    every chats refetch. Cap at 200 ids per call to keep the IN-clause
+    scan cheap on the (account_id, fan_id) composite primary key."""
+    parsed: list[int] = []
+    for chunk in ids.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            parsed.append(int(chunk))
+        except ValueError:
+            continue
+    if not parsed:
+        return {"fans": {}}
+    parsed = parsed[:200]
+
+    out: dict[str, dict[str, Any]] = {}
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(
+                Fan.fan_id, Fan.of_username, Fan.of_display_name,
+                Fan.avatar_url, Fan.custom_nickname,
+            )
+            .where(Fan.account_id == account_id, Fan.fan_id.in_(parsed))
+        )).all()
+        for fid, uname, dname, avatar, nickname in rows:
+            out[str(fid)] = {
+                "id": int(fid),
+                "name": dname,
+                "username": uname,
+                "avatar": avatar,
+                "customNickname": nickname,
+            }
+    return {"fans": out}
 
 
 @router.get("/admin/fans/{account_id}/spend-batch")
@@ -193,3 +231,46 @@ async def fans_spend_batch(
             entry["last_purchase_at"] = ts.isoformat() if ts else None
 
     return {"spend": out}
+
+
+# ── /{fan_id} routes — MUST be declared after every literal-third-segment
+#    route above (see ordering note near FanUpdateBody). ────────────────
+
+@router.get("/admin/fans/{account_id}/{fan_id}")
+async def get_fan(account_id: str, fan_id: int) -> dict[str, Any]:
+    """Return the fan row. Creates an empty stub on first access so the
+    drawer always has a row to edit — avoids 404-then-create dance from
+    the UI."""
+    async with get_session() as s:
+        f = await s.get(Fan, (account_id, fan_id))
+        if f is None:
+            await _ensure_account_row(s, account_id)
+            f = Fan(account_id=account_id, fan_id=fan_id, source="onlyfans")
+            s.add(f)
+            await s.commit()
+            await s.refresh(f)
+        return _row_to_dict(f)
+
+
+@router.patch("/admin/fans/{account_id}/{fan_id}")
+async def update_fan(
+    account_id: str, fan_id: int, body: FanUpdateBody = Body(...),
+) -> dict[str, Any]:
+    """Partial update. Only fields explicitly present in the body are
+    written; null is a deliberate clear, omission is "leave alone"."""
+    payload = body.model_dump(exclude_unset=True)
+    async with get_session() as s:
+        f = await s.get(Fan, (account_id, fan_id))
+        if f is None:
+            await _ensure_account_row(s, account_id)
+            f = Fan(account_id=account_id, fan_id=fan_id, source="onlyfans")
+            s.add(f)
+        for k, v in payload.items():
+            if k == "tags":
+                f.tags = json.dumps(v or [])
+            else:
+                setattr(f, k, v)
+        f.updated_at = datetime.utcnow()
+        await s.commit()
+        await s.refresh(f)
+        return _row_to_dict(f)

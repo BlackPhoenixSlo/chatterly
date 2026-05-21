@@ -64,7 +64,7 @@ done
 
 # ── 3. health probes ──────────────────────────────────────────
 section "health"
-TOK="${SHARE_TOKEN:?set SHARE_TOKEN before running diag}"
+TOK="${SHARE_TOKEN:-kE5uOG47-gNIxmYzn7rSRCsINYUu0g-h}"
 for url in \
   "http://127.0.0.1:8787/health" \
   "http://127.0.0.1:3001/inbox?t=$TOK" \
