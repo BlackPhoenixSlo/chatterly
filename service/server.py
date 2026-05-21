@@ -1698,13 +1698,26 @@ def _storyboard_extract_batch(
     file per `-i` (keyframe seek is fast on local disk) but the process
     spawn happens only once per batch — cuts pass-1 latency by ~4x for a
     4-frame batch vs. one subprocess per frame. Frames write directly to
-    their final 0-based name."""
+    their final 0-based name.
+
+    Tolerates partial success: short clips with rounded-up duration
+    metadata will fail the last seek at/past EOF; we keep whatever did
+    land and backfill the rest from the nearest neighbour so the
+    storyboard is always complete-shaped. Returns False only if zero
+    frames came out — that's the case where the source mp4 is unreadable
+    or the timeout fired."""
     import subprocess
+    # Stay at least 100ms before the encoded EOF — ffmpeg can't seek past
+    # the last decodable frame, and short clips whose container metadata
+    # rounds the duration up (e.g. "4.0s" for a 3.93s file) would otherwise
+    # blow up on the last index.
+    safe_dur = max(0.1, dur - 0.1)
     args: list[str] = ["ffmpeg", "-y", "-nostdin", "-loglevel", "error"]
     for pos, i in enumerate(indices):
         # Mid-segment seek (i + 0.5) lands away from cut boundaries where
         # an I-frame might be black or a hard transition.
         ts = (i + 0.5) * dur / _STORYBOARD_FRAMES
+        ts = min(ts, safe_dur)
         out_path = dest / f"{i}.jpg"
         args += [
             "-ss", f"{ts:.4f}", "-i", str(src_path),
@@ -1714,18 +1727,49 @@ def _storyboard_extract_batch(
             "-q:v", "5",
             str(out_path),
         ]
+    rc = -1
     try:
-        subprocess.run(
-            args, check=True, capture_output=True,
+        proc = subprocess.run(
+            args, check=False, capture_output=True,
             timeout=_STORYBOARD_BUILD_TIMEOUT_S,
         )
-        return True
+        rc = proc.returncode
     except Exception:
         log.warning(
-            "storyboard batch extract failed for %s indices=%s",
+            "storyboard batch extract crashed for %s indices=%s",
             dest.name, indices, exc_info=True,
         )
+
+    landed = [i for i in indices if (dest / f"{i}.jpg").is_file()]
+    if not landed:
+        log.warning(
+            "storyboard batch extract produced no frames for %s "
+            "(rc=%s indices=%s dur=%.3f)",
+            dest.name, rc, indices, dur,
+        )
         return False
+    if len(landed) < len(indices):
+        # Backfill missing indices by copying the nearest neighbour so the
+        # storyboard is always complete-shaped after a build. Without this
+        # any missing frame would trigger a fresh download+extract on the
+        # next request and fail the same way — an infinite loop.
+        import shutil
+        for i in indices:
+            if (dest / f"{i}.jpg").is_file():
+                continue
+            nearest = min(landed, key=lambda j: abs(j - i))
+            try:
+                shutil.copyfile(dest / f"{nearest}.jpg", dest / f"{i}.jpg")
+            except Exception:
+                log.warning(
+                    "storyboard backfill copy %s→%s failed for %s",
+                    nearest, i, dest.name, exc_info=True,
+                )
+        log.info(
+            "storyboard partial extract for %s: %d/%d frames (rc=%s dur=%.3f, backfilled rest)",
+            dest.name, len(landed), len(indices), rc, dur,
+        )
+    return True
 
 
 def _ensure_storyboard_frame(
