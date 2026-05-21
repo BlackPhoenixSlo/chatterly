@@ -37,6 +37,11 @@ services:
       # Anyone who has this token can hit /ui/?t=<token> and act as your
       # captured OF account, so treat it like a password.
       SHARE_TOKEN: "${SHARE_TOKEN:?set SHARE_TOKEN before docker compose up}"
+      # Where the video scrub storyboard cache lives. Bind-mounted below
+      # so it persists across container restarts — without this every
+      # `docker compose down` wipes hours of accumulated extracts and
+      # every hover becomes a cold 3-7s build through the proxy.
+      STORYBOARD_DIR: "/app/service/storyboard_cache"
     volumes:
       # File bind-mount for the SQLite event store. WAL + SHM sidecars
       # are created in /app/service/ inside the container; on `docker
@@ -45,6 +50,10 @@ services:
       - ./service/chatterly.db:/app/service/chatterly.db
       - ./service/sessions:/app/service/sessions
       - ./service/proxies.json:/app/service/proxies.json
+      # Storyboard cache. Each video gets a dir of 12 small jpgs (~10-25
+      # KB each) keyed by URL hash. Survives container rebuilds so a
+      # familiar vault stays scrub-warm.
+      - ./service/storyboard_cache:/app/service/storyboard_cache
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
       interval: 30s

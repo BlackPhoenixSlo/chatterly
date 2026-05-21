@@ -57,6 +57,7 @@ cd chatterly
 # open them). You will fill both from the UI later.
 echo '{"proxies": []}' > service/proxies.json
 touch service/chatterly.db
+mkdir -p service/storyboard_cache
 
 # SHARE_TOKEN gates every non-/health request. Generate one and keep it
 # somewhere safe — anyone with this token can act as your captured OF
