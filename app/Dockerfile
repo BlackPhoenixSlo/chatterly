@@ -17,8 +17,14 @@ RUN corepack enable && corepack prepare pnpm@9 --activate
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
-# next.config.ts reads RELAY_URL at request time (via rewrites()), not at
-# build time, so the build is environment-agnostic. The runner stage sets it.
+# Next bakes rewrite destinations into .next/routes-manifest.json at build
+# time — if RELAY_URL isn't set here the manifest gets the localhost
+# fallback baked in and every API call from the running container hits
+# its own loopback (ECONNREFUSED). The runner stage's RELAY_URL is too
+# late by then. Override at build time via compose `build.args.RELAY_URL`
+# if you ever need a different value.
+ARG RELAY_URL=http://relay:8787
+ENV RELAY_URL=$RELAY_URL
 COPY . .
 RUN pnpm build
 
