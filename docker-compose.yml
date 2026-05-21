@@ -55,7 +55,7 @@ services:
       # familiar vault stays scrub-warm.
       - ./service/storyboard_cache:/app/service/storyboard_cache
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/livez"]
       interval: 30s
       timeout: 5s
       start_period: 20s
@@ -90,18 +90,14 @@ services:
       RELAY_URL: "http://relay:8787"
     depends_on:
       relay:
-        # service_started, NOT service_healthy. Relay's healthcheck hits
-        # /health which 503's when no OF account sessions are loaded —
-        # the desired "is the process alive" signal is conflated with
-        # "do I have data to serve." For a brand-new install (zero
-        # captured sessions yet) service_healthy would deadlock the
-        # whole stack: the app waits for a relay that can't become
-        # healthy until a session exists, and the login/capture flow
-        # that creates the first session lives inside the app the user
-        # can't reach. service_started keeps deploys bootable; any
-        # call from the app to a relay endpoint that needs a session
-        # still returns 503/401 and the UI can route around it.
-        condition: service_started
+        # service_healthy is the correct signal now that the relay's
+        # HEALTHCHECK probes /livez (process-alive only) instead of
+        # /health (which 503s with no sessions and used to deadlock
+        # fresh deploys). The app waits until uvicorn is actually
+        # answering, but no longer until a session exists — that step
+        # happens through the app itself, paste-cURL via Settings or
+        # the /ui/ bootstrap form.
+        condition: service_healthy
     healthcheck:
       # `next start` doesn't expose a dedicated health endpoint, but `/`
       # is the home redirect to /inbox and is always served in prod.

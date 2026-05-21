@@ -66,7 +66,7 @@ RUN mkdir -p /app/service/sessions
 EXPOSE 8787
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8787/health > /dev/null || exit 1
+  CMD curl -fsS http://127.0.0.1:8787/livez > /dev/null || exit 1
 
 # Single worker on purpose — SQLite write lock + the WebSocket pump is a
 # module-level singleton. Production mode, no --reload.

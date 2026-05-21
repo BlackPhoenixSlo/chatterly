@@ -156,7 +156,7 @@ async def _account_context(request: Request, call_next):
 async def _share_token_gate(request: Request, call_next):
     if not SHARE_TOKEN:
         return await call_next(request)
-    if request.url.path == "/health":
+    if request.url.path == "/health" or request.url.path == "/livez":
         return await call_next(request)
     if request.cookies.get(_SHARE_COOKIE) == SHARE_TOKEN:
         return await call_next(request)
@@ -689,6 +689,21 @@ def _proxy(call):
 
 
 # ── Endpoints ──────────────────────────────────────────────────
+
+@app.get("/livez")
+def livez():
+    """Process liveness probe. Returns 200 as long as FastAPI is running.
+
+    Distinct from /health which reports session/account readiness and can
+    return 503 when no OF account is loaded yet. The Docker HEALTHCHECK
+    directive aims this endpoint so a relay with zero captured sessions
+    (i.e. a brand-new install before paste-cURL bootstrap) is still
+    marked healthy — otherwise app.depends_on.relay:service_healthy
+    deadlocks fresh deploys, since the UI that creates the first session
+    lives behind that very dependency. Always cheap, no side effects, no
+    auth required (same exemption as /health from the share-token gate)."""
+    return {"ok": True}
+
 
 @app.get("/health")
 def health(request: Request, all_accounts: bool = Query(False, description="Probe every account, not just the requested one")):
