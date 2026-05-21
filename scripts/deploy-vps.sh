@@ -123,11 +123,22 @@ if [[ $COPY_SECRETS -eq 1 ]]; then
   [ -f "$LOCAL_PROXIES" ]  || die "no local proxies.json at $LOCAL_PROXIES"
   [ -f "$LOCAL_DB" ]       || die "no local chatterly.db at $LOCAL_DB"
 
-  # Push sessions (only the json/jsonl files — skip nothing-useful subdirs).
-  "${SCP[@]}" "$LOCAL_SESSIONS"/*.json "$SSH_TARGET:~/$REMOTE_DIR/service/sessions/" || \
-    echo "  (no session json files to copy)"
-  if compgen -G "$LOCAL_SESSIONS/active.json" > /dev/null; then
-    "${SCP[@]}" "$LOCAL_SESSIONS/active.json" "$SSH_TARGET:~/$REMOTE_DIR/service/sessions/" || true
+  # Top-level pointer files (active.json, latest.json, .migrated).
+  "${SCP[@]}" "$LOCAL_SESSIONS"/*.json "$SSH_TARGET:~/$REMOTE_DIR/service/sessions/" 2>/dev/null || \
+    echo "  (no top-level session json files to copy)"
+  if [ -f "$LOCAL_SESSIONS/.migrated" ]; then
+    "${SCP[@]}" "$LOCAL_SESSIONS/.migrated" "$SSH_TARGET:~/$REMOTE_DIR/service/sessions/" || true
+  fi
+  # The actual session blobs live under accounts/<account_id>/ — these
+  # carry the OF cookies the relay needs to authenticate. Without this
+  # the relay boots with 0 accounts and /health 503's. Capture-only
+  # subdirs (audit/, crawl/, browser_profiles/, etc.) are deliberately
+  # not copied — they're megabytes of replay data the runtime image
+  # doesn't need.
+  if [ -d "$LOCAL_SESSIONS/accounts" ]; then
+    "${SCP[@]}" -r "$LOCAL_SESSIONS/accounts" "$SSH_TARGET:~/$REMOTE_DIR/service/sessions/"
+  else
+    echo "  (no accounts/ subdir — relay will boot with 0 accounts; capture via Chrome extension after boot)"
   fi
   "${SCP[@]}" "$LOCAL_PROXIES" "$SSH_TARGET:~/$REMOTE_DIR/service/proxies.json"
   "${SCP[@]}" "$LOCAL_DB"      "$SSH_TARGET:~/$REMOTE_DIR/service/chatterly.db"
