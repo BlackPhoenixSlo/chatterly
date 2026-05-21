@@ -27,6 +27,11 @@ export interface RelayContext {
   shareToken?: string | null;
   employeeId?: number | null;
   accountId?: string | null;
+  /** Sent as `X-Priority`. The relay reserves slots in its per-account
+   *  upstream concurrency pool for "user" callers — anything tagged
+   *  "background" (chat-list enrichment, periodic refresh, prefetch)
+   *  may queue behind user-initiated work. Default: "user". */
+  priority?: "user" | "background";
 }
 
 /**
@@ -64,6 +69,7 @@ function buildHeaders(init?: RequestInit, ctx?: RelayContext): HeadersInit {
   if (!headers.has("Accept")) headers.set("Accept", "application/json");
   if (ctx?.employeeId != null) headers.set("X-Employee-Id", String(ctx.employeeId));
   if (ctx?.accountId) headers.set("X-Account-Id", String(ctx.accountId));
+  if (ctx?.priority === "background") headers.set("X-Priority", "background");
   // Only set content-type for JSON bodies. For FormData the browser
   // needs to set Content-Type itself so it can include the multipart
   // boundary — overriding here would corrupt the upload.
