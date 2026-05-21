@@ -110,13 +110,43 @@ export function ChatList({
       staleTime: PREFETCH_STALE_MS,
     }).catch(() => { /* fire-and-forget */ });
   }, [qc]);
+  // Vault prefetch on hover. TanStack treats prefetchQuery as a no-op
+  // when the query is still fresh (staleTime), so this is cheap to fire
+  // on every hover — if the inbox-wide warmer already populated this
+  // account's caches we just hit the in-memory hit and bail. When the
+  // user hovers a row faster than the warmer reaches that account, this
+  // covers the gap. Tagged background-priority so a concurrent vault
+  // open still jumps the lane. Keys mirror useVaultLists/useVaultMedia.
+  const prefetchVault = useCallback((aid: string) => {
+    if (!aid) return;
+    qc.prefetchQuery({
+      queryKey: ["vault-lists", aid],
+      queryFn: () =>
+        relay.get(
+          "/api/of/v2/vault/lists?view=main&limit=50",
+          { accountId: aid, priority: "background" },
+        ),
+      staleTime: 5 * 60 * 1000,
+    }).catch(() => {});
+    qc.prefetchInfiniteQuery({
+      queryKey: ["vault-media", aid, "all", null],
+      initialPageParam: 0,
+      queryFn: () =>
+        relay.get(
+          "/api/of/v2/vault/media?limit=24&offset=0&type=all",
+          { accountId: aid, priority: "background" },
+        ),
+      staleTime: 60_000,
+    }).catch(() => {});
+  }, [qc]);
   const scheduleRowPrefetch = useCallback((aid: string, fid: number) => {
     if (prefetchTimerRef.current != null) window.clearTimeout(prefetchTimerRef.current);
     prefetchTimerRef.current = window.setTimeout(() => {
       prefetchTimerRef.current = null;
       prefetchMessages(aid, fid);
+      prefetchVault(aid);
     }, PREFETCH_DWELL_MS);
-  }, [prefetchMessages]);
+  }, [prefetchMessages, prefetchVault]);
   const cancelRowPrefetch = useCallback(() => {
     if (prefetchTimerRef.current != null) {
       window.clearTimeout(prefetchTimerRef.current);

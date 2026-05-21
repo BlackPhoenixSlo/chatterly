@@ -39,68 +39,83 @@ export default function InboxPage() {
     }
   }, [scope, selected]);
 
-  // Background-warm wall-media for every account, slowly. Wall-media
-  // walks up to 5 OF post pages per account (10–18s each) — when we
-  // fired them eagerly on mount they DOMINATED the cold load. Now:
-  //   • we wait 10s post-mount so /chats + first paint + decoration
-  //     waves are all done,
-  //   • we serialize accounts with a 4s gap so the relay/OF stay free
-  //     for click-through traffic.
-  // VaultPicker reads from this same query cache, so by the time the
-  // user opens it the blue ring data is already populated. If they
-  // open faster than the warmer reaches that account, the picker
-  // renders anyway — rings just pop in when the call lands.
+  // Background-warm the vault caches so the first VaultPicker open is
+  // instant. Two waves, both tagged `X-Priority: background` so the
+  // relay's per-account lane (4 total / 2 background slots, see
+  // service/server.py `_priority_lane`) always keeps reserved slots for
+  // a user click that lands mid-warm. Within an account, lists + first
+  // page of media run in parallel. Across accounts, accounts also run
+  // in parallel — lanes are per-account so they don't interfere, and
+  // network is the only shared resource.
+  //
+  // Wave 1 (cheap, fires ~800ms after mount): vault-lists + vault-media
+  //   first page. These are what VaultPicker reads on open. Together
+  //   they cover the "click vault → grid is already there" case.
+  //
+  // Wave 2 (expensive, fires ~15s after mount): wall-media. This walks
+  //   5 OF post pages per account and drives the blue "sent on wall"
+  //   rings in the picker. The grid renders without it; rings just pop
+  //   in when wave 2 lands. Delayed so it doesn't share bandwidth with
+  //   wave 1 or with first-click traffic.
+  //
+  // If a user opens the picker between mount and wave 1 they pay the
+  // OF cold cost once — but the relay lane reservation means their
+  // call jumps ahead of anything still queued for background.
   useEffect(() => {
     if (accounts.length === 0) return;
     let cancelled = false;
-    const warm = async () => {
-      // Initial pause: give the UI a clean 10s of zero background load
-      // so cold-load decoration + first interaction is unimpeded.
-      await new Promise((r) => setTimeout(r, 10_000));
-      for (const acc of accounts) {
-        if (cancelled) return;
-        // vault-lists is cheap (~500ms) — kicks off first so the
-        // folder dropdown is instant when the picker opens.
-        await qc.prefetchQuery({
-          queryKey: ["vault-lists", acc.id],
+    const BG = { priority: "background" as const };
+
+    const warmAccount = async (aid: string) => {
+      if (cancelled) return;
+      await Promise.all([
+        qc.prefetchQuery({
+          queryKey: ["vault-lists", aid],
           queryFn: () =>
-            relay.get("/api/of/v2/vault/lists?view=main&limit=50", { accountId: acc.id }),
+            relay.get("/api/of/v2/vault/lists?view=main&limit=50", { accountId: aid, ...BG }),
           staleTime: 5 * 60 * 1000,
-        }).catch(() => {});
-        if (cancelled) return;
-        // First page of vault media (default "all" type, no folder) — the
-        // exact query useVaultMedia issues when the picker opens. With this
-        // warm, the grid renders instantly; without it the user waits for
-        // /vault/media (~700ms) on first open. Key shape mirrors
-        // useVaultMedia: ["vault-media", accountId, type, listId].
-        await qc.prefetchInfiniteQuery({
-          queryKey: ["vault-media", acc.id, "all", null],
+        }).catch(() => {}),
+        qc.prefetchInfiniteQuery({
+          queryKey: ["vault-media", aid, "all", null],
           initialPageParam: 0,
           queryFn: () =>
             relay.get(
               "/api/of/v2/vault/media?limit=24&offset=0&type=all",
-              { accountId: acc.id },
+              { accountId: aid, ...BG },
             ),
           staleTime: 60_000,
-        }).catch(() => {});
-        if (cancelled) return;
-        // wall-media is the expensive one (5-page OF post walk). Cached
-        // already from a previous session? prefetchQuery is a no-op when
-        // staleTime hasn't elapsed.
-        await qc.prefetchQuery({
-          queryKey: ["wall-media", acc.id],
-          queryFn: () =>
-            relay.get(`/admin/vault/wall-media?account_id=${encodeURIComponent(acc.id)}`),
-          staleTime: 60 * 60 * 1000,
-        }).catch(() => {});
-        if (cancelled) return;
-        // Pace between accounts so a 5-account workspace doesn't pin
-        // the relay's stream pool for 90s straight.
-        await new Promise((r) => setTimeout(r, 4_000));
-      }
+        }).catch(() => {}),
+      ]);
     };
-    void warm();
-    return () => { cancelled = true; };
+
+    const warmWallMedia = async (aid: string) => {
+      if (cancelled) return;
+      await qc.prefetchQuery({
+        queryKey: ["wall-media", aid],
+        queryFn: () =>
+          relay.get(
+            `/admin/vault/wall-media?account_id=${encodeURIComponent(aid)}`,
+            BG,
+          ),
+        staleTime: 60 * 60 * 1000,
+      }).catch(() => {});
+    };
+
+    const t1 = window.setTimeout(() => {
+      if (cancelled) return;
+      void Promise.all(accounts.map((a) => warmAccount(a.id)));
+    }, 800);
+
+    const t2 = window.setTimeout(() => {
+      if (cancelled) return;
+      void Promise.all(accounts.map((a) => warmWallMedia(a.id)));
+    }, 15_000);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
   }, [accounts, qc]);
 
   return (
