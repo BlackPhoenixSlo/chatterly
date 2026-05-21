@@ -21,7 +21,15 @@
  * avoid Turbopack dev confusing the SW lifecycle.
  */
 
-const CACHE = "chatterly-img-v1";
+// v2: previous version ran buildKeyRequest() over /img/scrub, collapsing
+// all 12 storyboard frames + every video to a single cache entry (because
+// the path equality check didn't match /img/scrub, it fell into the
+// by-hash branch which produced /img-cache-key/h//img/scrub/<account>
+// for every scrub request — first response served for all subsequent
+// frame indices). The fetch handler now skips /img/scrub entirely
+// (relay disk-caches those by hash+index, no SW caching needed); the
+// version bump drops the poisoned v1 cache on activate.
+const CACHE = "chatterly-img-v2";
 // 2-day TTL fresh, 4 days hard expiry. Avatars rarely change; if a fan
 // updates their avatar the worst case is a 2-day stale chip.
 const TTL_MS = 2 * 24 * 3600 * 1000;
@@ -59,6 +67,11 @@ self.addEventListener("fetch", (event) => {
   // Same-origin only — only intercept our own /img endpoints.
   if (url.origin !== self.location.origin) return;
   if (!url.pathname.startsWith("/img")) return;
+  // /img/scrub returns per-frame storyboard jpgs, already disk-cached by
+  // the relay (immutable Cache-Control). The browser's HTTP cache handles
+  // it; trying to SW-cache it broke the per-frame keying and froze
+  // every video at the first cached frame. Skip the SW for that route.
+  if (url.pathname === "/img/scrub" || url.pathname.startsWith("/img/scrub/")) return;
   event.respondWith(handleImage(req, url));
 });
 

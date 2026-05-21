@@ -14,7 +14,7 @@
  * only their ids in send-payload form.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/primitives";
 import { cn } from "@/lib/utils";
@@ -217,8 +217,17 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
   // may have moved to another tile before they fire. Comparing m.id against
   // the LATEST hoveredVideoId via ref avoids stale-closure scrubReady flips
   // affecting the wrong tile.
+  //
+  // useLayoutEffect (NOT useEffect) is critical: when a storyboard is
+  // already cached, the browser fires <img>.onLoad synchronously after the
+  // commit, BEFORE the post-paint useEffect would update the ref. The guard
+  // then rejects (ref still holds prior value), scrubReady never flips,
+  // the visible img stays at opacity:0, and only frame 0 ever "shows"
+  // (it's actually invisible, but the static thumb beneath leaks through
+  // long enough to look like a stuck frame 0). useLayoutEffect runs after
+  // commit + before paint, so the ref is current by the time onLoad fires.
   const hoveredVideoIdRef = useRef<number | null>(null);
-  useEffect(() => { hoveredVideoIdRef.current = hoveredVideoId; }, [hoveredVideoId]);
+  useLayoutEffect(() => { hoveredVideoIdRef.current = hoveredVideoId; }, [hoveredVideoId]);
   // Duration of the hovered video, captured at hover-commit time so the
   // countdown effect can compute the wait estimate without needing to
   // forward-reference visibleItems (which is declared after the effect).
@@ -478,9 +487,22 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
   // Local sort applied AFTER the server paginated list lands. OF doesn't
   // expose sort=asc on the vault endpoint, so reversing here is the only
   // way to honor "Oldest first". Items arrive in createdAt-DESC order.
+  //
+  // Dedup by id along the way — OF's vault pagination occasionally returns
+  // the same item across adjacent pages (race between a vault edit and
+  // our offset-based reads), and React would warn about duplicate keys
+  // on the tile <button>s. Keep the FIRST occurrence so the position the
+  // user already sees stays stable when a re-fetch overlaps.
   const visibleItems = useMemo(() => {
-    if (sort === "oldest") return [...vault.items].reverse();
-    return vault.items;
+    const ordered = sort === "oldest" ? [...vault.items].reverse() : vault.items;
+    const seen = new Set<number>();
+    const out: VaultMedia[] = [];
+    for (const m of ordered) {
+      if (seen.has(m.id)) continue;
+      seen.add(m.id);
+      out.push(m);
+    }
+    return out;
   }, [vault.items, sort]);
 
   // Folder quick-chips: three-tier fallback so the row is always useful.
@@ -648,12 +670,17 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
           {vault.isLoading && vault.items.length === 0 && (
             <div className="text-sm text-fg-dim text-center py-12">Loading vault…</div>
           )}
-          {vault.error && (
+          {/* Only surface an error when (a) we're not actively retrying
+           *  and (b) we have nothing cached to show. Otherwise React Query
+           *  will keep `vault.error` set from a stale attempt during the
+           *  retry backoff window, which used to flash a "Failed: …" line
+           *  for ~1s on first open before the retry succeeded. */}
+          {vault.error && !vault.isFetching && vault.items.length === 0 && (
             <div className="text-sm text-err text-center py-6">
               Failed: {(vault.error as Error).message || "unknown"}
             </div>
           )}
-          {!vault.isLoading && vault.items.length === 0 && !vault.error && (
+          {!vault.isLoading && !vault.isFetching && vault.items.length === 0 && !vault.error && (
             <div className="text-sm text-fg-dim text-center py-12">
               No media in this filter.
             </div>
@@ -744,43 +771,46 @@ export function VaultPicker({ open, onClose, accountId, fanId = null, initialSel
                           </div>
                         </>
                       )}
-                      <img
-                        src={scrubSrc}
-                        alt=""
-                        decoding="async"
-                        onLoad={() => {
-                          if (hoveredVideoIdRef.current !== m.id) return;
-                          setHoverLoading(false);
-                          // Frame landed → relay's first build pass is done →
-                          // safe to fan out prefetch for the rest. Frames in
-                          // the first batch (0, 3, 6, 9) return fast; the
-                          // other 8 trickle in as the second ffmpeg pass
-                          // finishes.
-                          setScrubReady(true);
-                        }}
-                        onError={() => { if (hoveredVideoIdRef.current === m.id) setHoverLoading(false); }}
-                        style={{ opacity: hoverLoading ? 0 : 1 }}
-                        className={cn(
-                          "relative w-full h-full object-cover transition-opacity duration-200",
-                          blurCls,
-                        )}
-                      />
-                      {/* Prefetch the other 11 frames once the first one is
-                       *  back. Avoids 12 parallel requests piling on the
-                       *  relay's per-video build lock. */}
-                      {scrubReady && Array.from({ length: SCRUB_FRAMES }).map((_, idx) =>
-                        idx === scrubFrameIdx ? null : (
-                          <img
-                            key={idx}
-                            src={proxyScrubFrame(rawVideoSrc, accountId, idx, m.duration, hoverSessionId)}
-                            alt=""
-                            aria-hidden
-                            loading="eager"
-                            decoding="async"
-                            className="hidden"
-                          />
-                        ),
-                      )}
+                      {/* Render all 12 frame <img>s once and toggle the
+                       *  visible one via opacity. Each <img> keeps its own
+                       *  src for the entire hover — no src swaps means no
+                       *  in-flight loads get cancelled by the browser when
+                       *  scrubFrameIdx ticks. Through a slow proxy, the old
+                       *  src-swap approach kept cancelling each new frame's
+                       *  fetch ~600ms after kickoff, so only frame 0 ever
+                       *  completed loading and the visible image stayed at
+                       *  frame 0 forever. This layered approach loads every
+                       *  frame to completion in parallel, then opacity
+                       *  switches them instantly.
+                       *
+                       *  The frame-0 element wears onLoad/onError so we
+                       *  still know when "first paint" lands (drives the
+                       *  hoverLoading shimmer and scrubReady gate). */}
+                      {Array.from({ length: SCRUB_FRAMES }).map((_, idx) => (
+                        <img
+                          // Per-frame key bound to tile id so a tile
+                          // transition forces fresh elements (no stale
+                          // paint from the previous tile).
+                          key={`${m.id}-frame-${idx}`}
+                          src={proxyScrubFrame(rawVideoSrc, accountId, idx, m.duration, hoverSessionId)}
+                          alt=""
+                          aria-hidden={idx !== scrubFrameIdx}
+                          decoding="async"
+                          onLoad={idx === 0 ? () => {
+                            if (hoveredVideoIdRef.current !== m.id) return;
+                            setHoverLoading(false);
+                            setScrubReady(true);
+                          } : undefined}
+                          onError={idx === 0 ? () => {
+                            if (hoveredVideoIdRef.current === m.id) setHoverLoading(false);
+                          } : undefined}
+                          style={{ opacity: idx === scrubFrameIdx && !hoverLoading ? 1 : 0 }}
+                          className={cn(
+                            "absolute inset-0 w-full h-full object-cover transition-opacity duration-200",
+                            blurCls,
+                          )}
+                        />
+                      ))}
                     </>
                   ) : thumb ? (
                     <img

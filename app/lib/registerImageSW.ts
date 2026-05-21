@@ -32,6 +32,13 @@ export function registerImageSW(): void {
 
   navigator.serviceWorker
     .register(SW_URL, { scope: "/" })
+    .then(async (reg) => {
+      // Force-update check so a freshly-deployed SW with a bug fix takes
+      // over the page without requiring the user to close every tab. The
+      // browser normally only re-checks the SW script on navigation; this
+      // makes us re-check on every page mount.
+      try { await reg.update(); } catch { /* non-fatal */ }
+    })
     .catch((err) => {
       console.warn("[sw] register failed", err);
     });

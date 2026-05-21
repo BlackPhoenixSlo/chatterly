@@ -20,6 +20,7 @@ service/chatterly.db-journal
 service/chatterly.db-wal
 service/chatterly.db-shm
 service/sessions/
+service/storyboard_cache/
 .run_public/
 onlystackAPP/
 
