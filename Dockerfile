@@ -22,9 +22,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 # curl_cffi ships pre-built libcurl-impersonate wheels for linux/amd64 +
 # linux/arm64, so no compiler toolchain is needed. ca-certificates is for
-# OF + proxy TLS verification. curl backs the HEALTHCHECK below.
+# OF + proxy TLS verification. curl backs the HEALTHCHECK below. ffmpeg
+# (+ ffprobe) is used by the vault-thumbnail extractor in server.py to
+# pull 12 frames out of source mp4s when the UI's VaultPicker hovers a
+# video tile.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
+ && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
