@@ -130,3 +130,30 @@ services:
       options:
         max-size: "2m"
         max-file: "2"
+
+  # ─── tunnel (opt-in) ─────────────────────────────────────────────
+  # Cloudflare quick tunnel. Exposes the Next.js UI (port 3001) to a
+  # public https://<random>.trycloudflare.com URL with TLS termination at
+  # Cloudflare's edge — no router config, no account, no domain.
+  #
+  # Start with:
+  #   docker compose --profile tunnel up -d
+  #   docker compose logs -f tunnel       # wait for the trycloudflare line
+  #
+  # The subdomain changes every restart (quick tunnels are stateless).
+  # SHARE_TOKEN is the only auth between a leaked URL and full account
+  # access — keep it secret, rotate it if leaked.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: chatterly-tunnel
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate --url http://app:3001
+    depends_on:
+      app:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
