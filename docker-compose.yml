@@ -81,6 +81,14 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3001:3001"
+    networks:
+      # default is the compose-internal network (so relay can resolve).
+      # n8n_default is the network the host's n8n-traefik-1 is on — putting
+      # the app there lets Traefik discover it via Docker labels (below)
+      # and route fuckinfloww.duckdns.org/* → chatterly-app:3001 with the
+      # already-working Let's Encrypt cert.
+      - default
+      - n8n_default
     environment:
       # `relay` resolves to the sibling container on the compose network.
       # next.config.ts's rewrites() forwards /api/of/*, /admin/*, /events,
@@ -114,6 +122,17 @@ services:
       retries: 3
     labels:
       autoheal: "true"
+      # Traefik discovery via the n8n-traefik-1 sidecar already running on
+      # this host. Host is the duckdns name; cert resolver name comes from
+      # n8n-traefik's CLI args (--certificatesresolvers.mytlschallenge.*).
+      # Port 3001 is the in-container Next prod port — Traefik talks to it
+      # over the n8n_default network, NOT through the 127.0.0.1 host bind.
+      traefik.enable: "true"
+      traefik.docker.network: "n8n_default"
+      traefik.http.routers.chatterly.rule: "Host(`fuckinfloww.duckdns.org`)"
+      traefik.http.routers.chatterly.entrypoints: "websecure"
+      traefik.http.routers.chatterly.tls.certresolver: "mytlschallenge"
+      traefik.http.services.chatterly.loadbalancer.server.port: "3001"
     logging:
       driver: json-file
       options:
@@ -171,3 +190,11 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+
+networks:
+  # External network created by the separate n8n compose stack on this
+  # host. We attach `app` to it so n8n-traefik-1 can route the duckdns
+  # host to chatterly via the Traefik labels declared on the service.
+  # `external: true` means compose won't try to create or delete it.
+  n8n_default:
+    external: true
